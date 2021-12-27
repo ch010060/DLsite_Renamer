@@ -131,7 +131,11 @@ def match_code(code):
         # fromstring()在解析xml格式時, 將字串轉換為Element對像, 解析樹的根節點
         # 在python中, 對get請求返回的r.content做fromstring()處理, 可以方便進行後續的xpath()定位等
         tree = html.fromstring(r.content)
-        img_url = tree.xpath('//meta[@name="twitter:image:src"]/@content')[0]
+        try:
+            img_url = tree.xpath('//meta[@name="twitter:image:src"]/@content')[0]
+        except os.error as err:
+            text.insert(tk.END, "**作品封面不存在!\n")
+            img_url = ""
         title = tree.xpath('//h1[@id="work_name"]/text()')[0]
         circle = tree.xpath(
             '//span[@itemprop="brand" and @class="maker_name"]/*/text()')[0]
