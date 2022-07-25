@@ -21,7 +21,7 @@ pip install requests
 ```
 
 ### Custom pattern：
-We will replace the filename with this keywords.  
+We will replace the filename with these keywords.  
 
 *Keyword List:*
 1. workno: 作品番號
@@ -37,9 +37,9 @@ We will replace the filename with this keywords.
 
 E.g, VJ009178 英雄伝説 零の軌跡
 
-**User defined template**: Please modify the "config.json" to custom your "type" and "to" replace rule, or use default template
+**User defined template**: Please modify the "config.json" to customize your "type" and "to" replace rules, or use default template
 
-The work code prefix meaning:  
+The prefix code meaning of DLsite works:  
 RJxxxxxx => ASMR/Music   
 BJxxxxxx => Doujin/Comic  
 VJxxxxxx => Game 
@@ -79,11 +79,11 @@ After：(ゲーム)(全年齢)[150417][VJ009178][Falcom] 英雄伝説 零の軌�
 ```
 
 ### Notice：
-1. Please modify the config.json with **UTF-8**.
+1. Please modify the config.json under **UTF-8**.
 ![Notepad3](https://i.imgur.com/L73BXEZ.png)
-2. You can delete the unnecessary string in【】in filename if required.
-3. Skip download the cover.jpg if it does exist.
-4. Special character processing: Convert the "Windows invalid character" to fullwidth form, multilple space to single space.
+2. You can delete the unnecessary string between【】in filename if required.
+3. Skip download the "cover.jpg" if it does exist.
+4. Special character processing: Convert the "Windows invalid character" to fullwidth form, multilple spaces to single space.
 
 ### (Optional) CLI version without GUI and loop：
 ```
