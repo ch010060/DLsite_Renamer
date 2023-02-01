@@ -31,7 +31,7 @@ R_COOKIE = {'adultchecked': '1'}
 
 # re.compile()返回一個匹配對像
 # ensure path name is exactly RJ?(\d{8}d{7}d{6}) or BJ?(\d{8}d{7}d{6}) or VJ?(\d{8}d{7}d{6})
-pattern = re.compile("([BRV][EJ])?(\d{8}|\d{7}|\d{6})")
+pattern = re.compile("([BRV][EJ])?(\d{8}|\d{7}|\d{6})|$")
 # filter to substitute illegal filenanme characters to " "
 filter = re.compile('[\\\/:"*?<>|]+')
 
