@@ -313,7 +313,7 @@ def thread_it(func, *args):
 
 
 root = tk.Tk()  # 實例化object，建立視窗root
-root.title('DLsite重命名工具 v3.3')  # 給視窗的標題取名字
+root.title('DLsite重命名工具 v3.5')  # 給視窗的標題取名字
 root.eval('tk::PlaceWindow . center')
 root.geometry('350x450')  # 設定視窗的大小(橫向 * 縱向)
 
