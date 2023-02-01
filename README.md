@@ -40,9 +40,9 @@ E.g, VJ009178 英雄伝説 零の軌跡
 **User defined template**: Please modify the "config.json" to customize your "type" and "to" replace rules, or use default template
 
 The prefix code meaning of DLsite works:  
-RJxxxxxx => ASMR/Music   
-BJxxxxxx => Doujin/Comic  
-VJxxxxxx => Game 
+RJ(6~8 digits) => ASMR/Music   
+BJ(6~8 digits) => Doujin/Comic  
+VJ(6~8 digits) => Game 
 
 E.g,
 ```
@@ -89,7 +89,7 @@ After：(ゲーム)(全年齢)[150417][VJ009178][Falcom] 英雄伝説 零の軌�
 ```
 usage: dlsite_renamer-cli.py [-h] [-d] [-c] [-r] -i PATH
 
-Renamer for DLsite works v3.0
+Renamer for DLsite works v3.4
 
 optional arguments:
   -h, --help            show this help message and exit
