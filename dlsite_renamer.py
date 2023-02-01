@@ -28,8 +28,8 @@ VJ_G_WEBPATH = 'https://www.dlsite.com/soft/work/=/product_id/'
 R_COOKIE = {'adultchecked': '1'}
 
 # re.compile()返回一個匹配對像
-# ensure path name is exactly RJ\d\d\d\d\d\d or BJ\d\d\d\d\d\d or VJ\d\d\d\d\d\d
-pattern = re.compile("[BRV][EJ]\d{6}|$")
+# ensure path name is exactly RJ?(\d{8}d{7}d{6}) or BJ?(\d{8}d{7}d{6}) or VJ?(\d{8}d{7}d{6})
+pattern = re.compile("([BRV][EJ])?(\d{8}|\d{7}|\d{6})")
 # filter to substitute illegal filenanme characters to " "
 filter = re.compile('[\\\/:"*?<>|]+')
 
@@ -189,7 +189,8 @@ def nameChange():
                 if recursive.get(): # 遞迴檢索需要修正路徑
                     path = os.path.split(file)[0]
                 # 嘗試獲取code
-                code = re.findall(pattern, file.upper())[0]
+                code_list = re.findall(pattern, file.upper())[0]
+                code = ''.join(code_list)
                 # 如果沒能提取到code
                 if not code:
                     continue  # 跳過該資料夾/檔案

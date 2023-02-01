@@ -30,8 +30,8 @@ VJ_G_WEBPATH = 'https://www.dlsite.com/soft/work/=/product_id/'
 R_COOKIE = {'adultchecked': '1'}
 
 # re.compile()返回一個匹配對像
-# ensure path name is exactly RJ\d\d\d\d\d\d or BJ\d\d\d\d\d\d or VJ\d\d\d\d\d\d
-pattern = re.compile("[BRV][EJ]\d{6}|$")
+# ensure path name is exactly RJ?(\d{8}d{7}d{6}) or BJ?(\d{8}d{7}d{6}) or VJ?(\d{8}d{7}d{6})
+pattern = re.compile("([BRV][EJ])?(\d{8}|\d{7}|\d{6})")
 # filter to substitute illegal filenanme characters to " "
 filter = re.compile('[\\\/:"*?<>|]+')
 
@@ -181,7 +181,8 @@ def nameChange(path, del_flag, cover_flag, recur_flag):
                 if recur_flag: # 遞迴檢索需要修正路徑
                     path = os.path.split(file)[0]
                 # 嘗試獲取code
-                code = re.findall(pattern, file.upper())[0]
+                code_list = re.findall(pattern, file.upper())[0]
+                code = ''.join(code_list)
                 # 如果沒能提取到code
                 if not code:
                     continue  # 跳過該資料夾/檔案
@@ -289,7 +290,7 @@ def dir_path(path):
         raise argparse.ArgumentTypeError(f"\"{path}\" is not a valid path!")
         
 def process_command():        
-    parser = argparse.ArgumentParser(description="Renamer for DLsite works v3.3")
+    parser = argparse.ArgumentParser(description="Renamer for DLsite works v3.4")
     parser.add_argument('-d', "--DEL", action='store_true', help='delete string in 【】')
     parser.add_argument('-c', "--COVER", action='store_true', help='download cover')
     parser.add_argument('-r', "--RECUR", action='store_true', help='recursively processing')
