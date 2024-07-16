@@ -232,6 +232,9 @@ def nameChange(path, del_flag, cover_flag, recur_flag):
                                 store_path = os.path.join(path, file, "cover.jpg")
                                 if not os.path.isfile(store_path):
                                     print("  下載封面...\n")
+                                    opener = urllib.request.build_opener()
+                                    opener.addheaders = [('User-agent', USER_AGENT)]
+                                    urllib.request.install_opener(opener)
                                     urllib.request.urlretrieve(img_url, store_path)
                                 else:
                                     print("**封面已存在，跳過下載!\n")
@@ -290,7 +293,7 @@ def dir_path(path):
         raise argparse.ArgumentTypeError(f"\"{path}\" is not a valid path!")
         
 def process_command():        
-    parser = argparse.ArgumentParser(description="Renamer for DLsite works v3.5")
+    parser = argparse.ArgumentParser(description="Renamer for DLsite works v3.6")
     parser.add_argument('-d', "--DEL", action='store_true', help='delete string in 【】')
     parser.add_argument('-c', "--COVER", action='store_true', help='download cover')
     parser.add_argument('-r', "--RECUR", action='store_true', help='recursively processing')

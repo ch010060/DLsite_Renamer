@@ -240,6 +240,9 @@ def nameChange():
                                 store_path = os.path.join(path, file, "cover.jpg")
                                 if not os.path.isfile(store_path):
                                     text.insert(tk.END, "  下載封面...\n")
+                                    opener = urllib.request.build_opener()
+                                    opener.addheaders = [('User-agent', USER_AGENT)]
+                                    urllib.request.install_opener(opener)
                                     urllib.request.urlretrieve(img_url, store_path)
                                 else:
                                     text.insert(tk.END, "**封面已存在，跳過下載!\n")
@@ -313,7 +316,7 @@ def thread_it(func, *args):
 
 
 root = tk.Tk()  # 實例化object，建立視窗root
-root.title('DLsite重命名工具 v3.5')  # 給視窗的標題取名字
+root.title('DLsite重命名工具 v3.6')  # 給視窗的標題取名字
 root.eval('tk::PlaceWindow . center')
 root.geometry('350x450')  # 設定視窗的大小(橫向 * 縱向)
 
