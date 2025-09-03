@@ -110,7 +110,7 @@ def match_code(code):
         url = VJ_WEBPATH + code
     try:
         # allow_redirects=False 禁止重定向
-        r = s.get(url, allow_redirects=False, cookies=R_COOKIE, headers=headers)
+        r = s.get(url, allow_redirects=True, cookies=R_COOKIE, headers=headers)
         # HTTP狀態碼==200表示請求成功
         if r.status_code != 200:
             #print("    Status code:", r.status_code, "\nurl:", url)
@@ -133,11 +133,19 @@ def match_code(code):
         # fromstring()在解析xml格式時, 將字串轉換為Element對像, 解析樹的根節點
         # 在python中, 對get請求返回的r.content做fromstring()處理, 可以方便進行後續的xpath()定位等
         tree = html.fromstring(r.content)
+        img_url = ""
         try:
-            img_url = tree.xpath('//meta[@name="twitter:image:src"]/@content')[0]
-        except os.error as err:
-            text.insert(tk.END, "**作品封面不存在!\n")
-            img_url = ""
+            img_url = tree.xpath('//meta[@property="og:image"]/@content')[0]
+        except IndexError:
+            try:
+                # Fallback to the original twitter meta tag
+                img_url = tree.xpath('//meta[@name="twitter:image:src"]/@content')[0]
+            except IndexError:
+                print("**作品封面不存在!\n")
+                img_url = ""
+        
+        if img_url and img_url.startswith('//'):
+            img_url = 'https:' + img_url
         title = tree.xpath('//h1[@id="work_name"]/text()')[0]
         circle = tree.xpath(
             '//span[@itemprop="brand" and @class="maker_name"]/*/text()')[0]
@@ -293,7 +301,7 @@ def dir_path(path):
         raise argparse.ArgumentTypeError(f"\"{path}\" is not a valid path!")
         
 def process_command():        
-    parser = argparse.ArgumentParser(description="Renamer for DLsite works v3.6")
+    parser = argparse.ArgumentParser(description="Renamer for DLsite works v3.7")
     parser.add_argument('-d', "--DEL", action='store_true', help='delete string in 【】')
     parser.add_argument('-c', "--COVER", action='store_true', help='download cover')
     parser.add_argument('-r', "--RECUR", action='store_true', help='recursively processing')
