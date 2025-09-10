@@ -15,9 +15,7 @@ Rename the DLsite works with custom pattern and download the cover If required.
 1. Install python3
 2. Install pip
 ```
-pip install lxml
-pip install tkintertable
-pip install requests
+python -m pip install -r requirements.txt
 ```
 
 ### Custom pattern：
