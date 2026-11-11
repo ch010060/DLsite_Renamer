@@ -7,7 +7,7 @@ import os
 
 import renamer_core as core
 
-VERSION = '4.0'
+VERSION = '4.1'
 
 # Tk is not thread-safe: the worker thread never touches widgets. It puts messages on this queue,
 # and the main thread (pump_ui) applies them.

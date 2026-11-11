@@ -740,12 +740,53 @@ class AsmrOneTest(unittest.TestCase):
         self.assertEqual(core.missing_fields(CONFIG_TEMPLATES['vj'], info.fields), ['circle'])
 
     def test_full_dlsite_without_cv_gets_cv_only(self):
-        dl = core.fields_from_product(PRODUCT['RJ01386956'])  # full DLsite data, no CV
-        info = self.merged('RJ01386956', core.WorkInfo(200, 'u', dl),
-                           plan={'api.asmr-200.com': [FakeResponse(200, dict(ASMR['RJ105661'], source_id='RJ01386956'))]})
+        dl = dict(core.fields_from_product(PRODUCT['RJ01671271']), cv=[])  # full DLsite data of a voice work, no CV
+        info = self.merged('RJ01671271', core.WorkInfo(200, 'u', dl),
+                           plan={'api.asmr-200.com': [FakeResponse(200, dict(ASMR['RJ105661'], source_id='RJ01671271'))]})
         self.assertEqual(info.fields['cv'], ['蒼紗', 'さくら真咲'])
         self.assertEqual({k: v for k, v in info.fields.items() if k != 'cv'}, {k: v for k, v in dl.items() if k != 'cv'})
         self.assertEqual(info.partial, '')
+
+    def test_non_voice_work_not_asked(self):  # games, manga, CG are never on ASMR.ONE
+        dl = core.fields_from_product(PRODUCT['RJ01386956'])  # シミュレーション -> ゲーム, no CV, has cover
+        self.assertEqual(dl['type'], 'ゲーム')
+        info = self.merged('RJ01386956', core.WorkInfo(200, 'u', dict(dl, img_url='')), want_cover=True)
+        self.assertEqual(self.session.calls, [])
+        self.assertEqual(info.fields['cv'], [])
+
+    def run_dlsite_down(self, asmr_has_works):
+        class Down:
+            def get(self, *a, **k):
+                return FakeResponse(500)
+
+        class Asmr:
+            def get(self, url, **k):
+                code = url.rsplit('/', 1)[1]
+                return FakeResponse(200, ASMR[code]) if asmr_has_works and code in ASMR else FakeResponse(404)
+        sleeps, logs = [], []
+        dl = core.DlsiteClient(log=logs.append, sleep=sleeps.append, session_factory=Down)
+        asmr = core.AsmrOneClient(log=logs.append, sleep=sleeps.append, session_factory=Asmr)
+        root = tempfile.mkdtemp()
+        try:
+            for code in list(ASMR) + ['BJ999999']:   # BJ sorts first and is never on ASMR.ONE
+                open(os.path.join(root, code + '.zip'), 'w').close()
+            report = core.process(root, core.Options(), core.Config(templates=dict(CONFIG_TEMPLATES)),
+                                  logs.append, dl, delay=0, asmr=asmr)
+        finally:
+            shutil.rmtree(root)
+        return report, sleeps, logs
+
+    def test_dlsite_down_asmr_one_up_no_pause(self):
+        report, sleeps, logs = self.run_dlsite_down(True)
+        self.assertEqual(report.renamed, len(ASMR))
+        self.assertEqual([(p.code, p.category) for p in report.problems], [('BJ999999', 'unavailable')])
+        self.assertNotIn(300, sleeps)                                            # no cool-down pause
+        self.assertTrue(any('改用 ASMR.ONE' in l for l in logs))
+
+    def test_dlsite_down_asmr_one_lacks_works_still_pauses(self):
+        report, sleeps, logs = self.run_dlsite_down(False)
+        self.assertIn(300, sleeps)
+        self.assertEqual(report.renamed, 0)
 
     def test_full_dlsite_with_cv_or_no_cv_template_not_asked(self):
         dl = core.fields_from_product(PRODUCT['RJ01671271'])                       # has CV

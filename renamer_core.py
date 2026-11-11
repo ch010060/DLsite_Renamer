@@ -308,7 +308,11 @@ class WorkInfo:
 
 
 class BatchAborted(Exception):
-    """DLsite kept blocking after the cool-down; stop asking it for more works."""
+    """Stop asking DLsite for more works (still failing after the cool-down, or the fallback covers it)."""
+
+    def __init__(self, message, fallback=False):
+        super().__init__(message)
+        self.fallback = fallback  # True: ASMR.ONE supplied the data, so no pause was needed
 
 
 def _yymmdd(date):
@@ -453,6 +457,7 @@ class DlsiteClient:
         self.cooled_down = False
         self.api_failures = 0        # product API failures in a row
         self.api_down = False        # skip the product API for the rest of the run
+        self.rescued = 0             # works in the current failure streak that ASMR.ONE supplied
         self.session = self._session_factory()
 
     # -- session -----------------------------------------------------------
@@ -665,13 +670,23 @@ class DlsiteClient:
 
     def _service_ok(self):
         self.blocked_streak = 0
+        self.rescued = 0
         self.cooled_down = False
+
+    def fallback_ok(self):
+        """Called by process() when ASMR.ONE supplied the data for a work DLsite could not give."""
+        self.rescued += 1
 
     def _service_failed(self, errors):
         """After block_limit works in a row without full data, cool down once; then stop."""
         self.blocked_streak += 1
         if self.blocked_streak < self.block_limit:
             return
+        if self.rescued:
+            # DLsite keeps failing but ASMR.ONE is supplying the data: stop asking DLsite now, without the
+            # cool-down pause (it would only delay the run). Works ASMR.ONE does not have (e.g. BJ) are listed.
+            raise BatchAborted(f'DLsite unavailable ({errors[-1]}); using ASMR.ONE for the remaining works',
+                               fallback=True)
         if self.cooled_down:
             raise BatchAborted(f'DLsite still unavailable after a {self.cooldown}s cool-down ({errors[-1]})')
         self.log(f"**連續 {self.blocked_streak} 個作品無法從 DLsite 取得完整資料, 暫停 {self.cooldown} 秒...")
@@ -713,6 +728,7 @@ WORK_TYPE_LABELS = {
     'RPG': 'ロールプレイング', 'SLN': 'シミュレーション', 'DNV': 'デジタルノベル', 'TBL': 'テーブル',
 }
 ASMR_ONE_AGES = {'general': '全年齢', 'r15': 'R-15', 'adult': 'R18'}
+ASMR_ONE_TYPES = ('ボイス・ASMR', '音楽')  # what ASMR.ONE has; other DLsite types are never asked for CV/cover
 
 
 def fields_from_asmr_one(w):
@@ -803,13 +819,15 @@ def with_asmr_one(code, info, template, asmr, cache, log, want_cover=False):
     """Second fallback (Phase 7): fill what DLsite could not give from ASMR.ONE.
 
     - DLsite gave no full data (any reason) -> merge: DLsite fields first, ASMR.ONE fills the gaps (cover included).
-    - DLsite gave full data but no CV (template uses cv) and/or no cover (want_cover) -> only those from ASMR.ONE.
+    - DLsite gave full data for a voice/music work but no CV (template uses cv) and/or no cover (want_cover)
+      -> only those from ASMR.ONE (other work types are not on ASMR.ONE, so they are not asked).
     """
     if asmr is None or code[:2] not in ASMR_ONE_PREFIXES:
         return info
     full = info.status == 200 and not info.partial
-    need_cv = full and not info.fields.get('cv') and 'cv' in KEYWORDS.findall(template)
-    need_cover = full and want_cover and not info.fields.get('img_url')
+    voice = full and info.fields.get('type') in ASMR_ONE_TYPES
+    need_cv = voice and not info.fields.get('cv') and 'cv' in KEYWORDS.findall(template)
+    need_cover = voice and want_cover and not info.fields.get('img_url')
     if full and not (need_cv or need_cover):
         return info
     key = 'asmr.one:' + code
@@ -994,14 +1012,19 @@ def _new_name_for(src, name, code, options, config, log, fetcher, cache, report,
     """Return (new_name, kind); kind is 'rename' / 'rename_shortened' (from the template) or 'repair'."""
     log('Processing: ' + code)
 
+    asked_dlsite = False
     if code not in cache:
+        asked_dlsite = not cache.get('__aborted__')
         if cache.get('__aborted__'):
             cache[code] = WorkInfo(-1, '', None, error=cache['__aborted__'])
         else:
             try:
                 cache[code] = fetcher.fetch(code)
             except BatchAborted as err:
-                log(f"**DLsite 持續無法使用, 停止查詢其餘作品: {err}")
+                if err.fallback:
+                    log("**DLsite 無法使用, 其餘作品不再查詢 DLsite, 改用 ASMR.ONE")
+                else:
+                    log(f"**DLsite 持續無法使用, 停止查詢其餘作品: {err}")
                 cache['__aborted__'] = str(err)
                 cache[code] = WorkInfo(-1, '', None, error=str(err))
             except OSError as err:  # requests' network errors are OSError subclasses
@@ -1011,6 +1034,8 @@ def _new_name_for(src, name, code, options, config, log, fetcher, cache, report,
     template = config.template_for(code)
     want_cover = options.download_cover and not options.dry_run and os.path.isdir(src)
     info = with_asmr_one(code, cache[code], template, asmr, cache, log, want_cover)
+    if asked_dlsite and info.partial.startswith('data from ASMR.ONE') and hasattr(fetcher, 'fallback_ok'):
+        fetcher.fallback_ok()  # lets the DLsite breaker skip its pause
 
     if info.status != 200:
         if info.status == 404:

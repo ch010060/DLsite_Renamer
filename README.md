@@ -128,7 +128,7 @@ After：(ゲーム)(全年齢)[150417][VJ009178][Falcom] 英雄伝説 零の軌�
 ```
 usage: dlsite_renamer-cli.py [-h] [-d] [-c] [-r] [-n] -i PATH
 
-Renamer for DLsite works v4.0
+Renamer for DLsite works v4.1
 
 options:
   -h, --help            show this help message and exit
