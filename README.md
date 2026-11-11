@@ -106,10 +106,14 @@ After：(ゲーム)(全年齢)[150417][VJ009178][Falcom] 英雄伝説 零の軌�
 7. An existing file is never overwritten; the conflict is listed instead.
 8. Works that are not renamed are listed at the end with the reason (missing fields, not found, blocked,
    name too long, conflict, error). The CLI exits with code 1 when the list is not empty.
-9. Work data comes from DLsite's product data (one request per work, every DLsite section). If DLsite blocks
-   requests (HTTP 403/429/503/529), the renamer waits and retries, then uses DLsite's basic info (title, date,
-   age, cover) — works whose template needs more are listed, not renamed. After 3 blocked works in a row it
-   pauses 5 minutes; if still blocked, it stops asking DLsite and lists the remaining works.
+9. Work data comes from DLsite's product data (one request per work, every DLsite section). This is not an
+   official DLsite API, so if it fails in any way (blocked 403/429/503/529 after waiting and retrying, removed,
+   server error, maintenance page, changed format, network error), the renamer uses DLsite's basic info
+   (title, date, age, cover) plus the work's own web page (circle, CV, author, type). Works without a web page
+   (e.g. comics sold on comipo, AI works, old English-site works) and translations whose template needs the
+   circle are listed, not renamed. After 3 product-data failures in a row the rest of the run uses the fallback
+   directly. After 3 works in a row without full data from any source it pauses 5 minutes; if still failing,
+   it stops asking DLsite and lists the remaining works.
 10. In recursive mode, files inside a work folder keep their own names unless they contain a work code themselves.
 
 ### (Optional) CLI version without GUI and loop：

@@ -342,6 +342,10 @@ def fields_from_product(w):
     }
 
 
+def _is_translation(t):
+    return isinstance(t, dict) and bool(t.get('is_parent') or t.get('is_child'))
+
+
 def fields_from_info(w):
     """Fields from the basic info endpoint. circle/cv/author/type are unknown (None)."""
     date = _yymmdd(w.get('regist_date'))
@@ -352,6 +356,84 @@ def fields_from_info(w):
         'release_date': None if (w.get('regist_date') or '').startswith('5100') else date,  # 5100 = no date
         'img_url': _cover_url(w.get('work_image')),
         'site_id': w.get('site_id'),
+        'translation': _is_translation(w.get('translation_info')),
+    }
+
+
+class SourceError(Exception):
+    """One DLsite source could not answer. status: HTTP status, 0 = network error, -2 = unusable response."""
+
+    def __init__(self, status, reason):
+        super().__init__(reason)
+        self.status, self.reason = status, reason
+
+
+DEFAULT_SITE = {'RJ': 'maniax', 'RE': 'maniax', 'BJ': 'books', 'VJ': 'pro'}  # when basic info is unavailable
+_WORK_PAGE_URL = re.compile(r'https://www\.dlsite\.com/[\w-]+/(work|announce)/=/product_id/(\w+)\.html')
+
+
+def _valid_product(w):
+    return isinstance(w, dict) and 'work_name' in w and 'maker_name' in w
+
+
+def is_work_page(url, code):
+    """The final URL after redirects is this work's DLsite page (a translation may show its parent page)."""
+    m = _WORK_PAGE_URL.match(url or '')
+    return bool(m) and (m.group(2) == code or f'translation={code}' in url)
+
+
+_PAGE_CIRCLE_LABELS = ('サークル名', 'ブランド名', '出版社名')
+
+
+def parse_work_page(content):
+    """Fields from a DLsite work page; supports the legacy (th/td) and the new (dt/dd) layout.
+
+    Labels are Japanese because the client sends the locale=ja_JP cookie.
+    """
+    from lxml import html
+    if isinstance(content, bytes):  # DLsite pages are UTF-8; do not let lxml guess (it assumes Latin-1)
+        content = content.decode('utf-8', 'replace')
+    tree = html.fromstring(content)
+
+    def clean(text):
+        return re.sub(r'\s+', ' ', text or '').strip()
+
+    def cell(*labels):
+        for label in labels:
+            for key in tree.xpath('//th | //dt'):
+                if clean(key.text_content()) == label and key.getnext() is not None:
+                    return key.getnext()
+        return None
+
+    def links(c):
+        if c is None:
+            return []
+        values = [clean(a.text_content()) for a in c.xpath('.//a')]
+        return [v for v in values if v and v != 'フォローする']
+
+    def first_text(c):
+        if c is None:
+            return None
+        values = links(c) or [clean(t) for t in c.xpath('.//span//text()') if clean(t)] or [clean(c.text_content())]
+        return values[0] if values and values[0] else None
+
+    h1 = tree.xpath('//h1[@id="work_name"]')
+    cv_cell = cell('声優')
+    cv = links(cv_cell) or ([v.strip() for v in clean(cv_cell.text_content()).split('/') if v.strip()]
+                            if cv_cell is not None else [])
+    date = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日', clean(cell('販売日').text_content())
+                     if cell('販売日') is not None else '')
+    work_type = first_text(cell('作品形式'))
+    og = tree.xpath('//meta[@property="og:image"]/@content')
+    return {
+        'title': clean(h1[0].text_content()) or None if h1 else None,
+        'circle': first_text(cell(*_PAGE_CIRCLE_LABELS)),
+        'cv': cv,
+        'author': links(cell('著者')),
+        'type': _work_type(work_type) if work_type else None,
+        'work_age': first_text(cell('年齢指定')),
+        'release_date': f'{date.group(1)[2:]}{int(date.group(2)):02d}{int(date.group(3)):02d}' if date else None,
+        'img_url': _cover_url(og[0] if og else ''),
     }
 
 
@@ -364,8 +446,10 @@ class DlsiteClient:
         self.backoff, self.block_limit, self.cooldown, self.timeout = backoff, block_limit, cooldown, timeout
         self._session_factory = session_factory or self._make_session
         self._ua = None
-        self.blocked_streak = 0
+        self.blocked_streak = 0      # works in a row without full data (any source)
         self.cooled_down = False
+        self.api_failures = 0        # product API failures in a row
+        self.api_down = False        # skip the product API for the rest of the run
         self.session = self._session_factory()
 
     # -- session -----------------------------------------------------------
@@ -419,56 +503,180 @@ class DlsiteClient:
         return response
 
     def fetch(self, code):
-        """Return a WorkInfo for one work code. Raises BatchAborted, or requests' (OSError) network errors."""
-        params = {'workno': code}
-        r = self._get(PRODUCT_URL, params)
-        url = r.url if hasattr(r, 'url') else PRODUCT_URL
-        if r.status_code == 200:
-            self._not_blocked()
-            data = r.json()
-            if data:
-                fields = fields_from_product(data[0])
-                return WorkInfo(200, WORK_PAGE.format(site=fields['site_id'], code=code), fields)
-            # No full data. Some listings (e.g. per-chapter comics 【話販売】) only have basic info.
-            return self._basic_info(code, WorkInfo(404, url), 'DLsite has only basic info for this work')
-        if r.status_code not in BLOCKED_STATUSES:
-            return WorkInfo(r.status_code, url)
+        """Return a WorkInfo for one work code. Raises BatchAborted.
 
-        # Still blocked: basic info as the second source.
-        self.log("**完整資料被拒絕, 改用基本資料 (只有標題/日期/年齡/封面)")
-        result = self._basic_info(code, WorkInfo(r.status_code, url),
-                                  'DLsite blocked the full data; only basic info was available')
-        self._blocked()
+        product.json -> (if it fails in any way) basic info + the work's web page.
+        """
+        if self.api_down:
+            api_error = SourceError(-2, 'skipped (product API failed earlier in this run)')
+        else:
+            try:
+                data = self._product(code)
+            except SourceError as err:
+                api_error = err
+                self._api_failed(err)
+            else:
+                self.api_failures = 0
+                if data:
+                    self._service_ok()
+                    fields = fields_from_product(data[0])
+                    return WorkInfo(200, WORK_PAGE.format(site=fields['site_id'], code=code), fields)
+                # Empty: no full data. Some listings (per-chapter comics 【話販売】, unreleased works) only have
+                # basic info; unknown codes have nothing.
+                return self._basic_only(code)
+        return self._fallback(code, api_error)
+
+    # -- sources -------------------------------------------------------------
+    def _request(self, url, params):
+        """GET (with the blocked back-off); network errors become SourceError."""
+        try:
+            return self._get(url, params)
+        except OSError as err:  # requests' network errors are OSError subclasses
+            raise SourceError(0, f'network error: {err}')
+
+    @staticmethod
+    def _check(r):
+        if r.status_code in BLOCKED_STATUSES:
+            raise SourceError(r.status_code, f'HTTP {r.status_code} (blocked)')
+        if r.status_code != 200:
+            raise SourceError(r.status_code, f'HTTP {r.status_code}')
+
+    @staticmethod
+    def _json(r):
+        try:
+            return r.json()
+        except ValueError:
+            raise SourceError(-2, 'response is not JSON (maintenance page or API changed)')
+
+    def _product(self, code):
+        """product.json entries (a list; empty when DLsite has no full data). Raises SourceError."""
+        r = self._request(PRODUCT_URL, {'workno': code})
+        self._check(r)
+        data = self._json(r)
+        if not isinstance(data, list) or (data and not _valid_product(data[0])):
+            raise SourceError(-2, 'unexpected product data format (API changed?)')
+        return data
+
+    def _basic(self, code):
+        """Basic-info fields, or None when DLsite does not know the code. Raises SourceError."""
+        r = self._request(INFO_URL, {'product_id': code, 'cdn_cache_min': 1})
+        self._check(r)
+        data = self._json(r)
+        if not data:
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get(code), dict):
+            raise SourceError(-2, 'unexpected basic info format')
+        return fields_from_info(data[code])
+
+    def _page(self, code, site):
+        """Fields parsed from the work's own web page, or None if it has none. Raises SourceError."""
+        url = WORK_PAGE.format(site=site, code=code)
+        r = self._request(url, None)
+        if r.status_code in (404, 410):
+            return None
+        self._check(r)
+        if not is_work_page(getattr(r, 'url', url), code):
+            return None  # redirected somewhere else (another site, a top page): not this work's data
+        try:
+            return parse_work_page(r.content)
+        except ImportError:
+            raise SourceError(-2, 'lxml is not installed (pip install -r requirements.txt)')
+
+    # -- combining sources -----------------------------------------------------
+    def _basic_only(self, code):
+        try:
+            info = self._basic(code)
+        except SourceError as err:
+            return self._failed(code, [f'product data: none; basic info: {err.reason}'], [err])
+        self._service_ok()
+        if info is None:
+            return WorkInfo(404, WORK_PAGE.format(site='maniax', code=code))
+        return WorkInfo(200, WORK_PAGE.format(site=info['site_id'], code=code), info,
+                        partial='DLsite has only basic info for this work')
+
+    def _fallback(self, code, api_error):
+        if not self.api_down:
+            self.log(f"**作品資料 API 失敗 ({api_error.reason}), 改用基本資料 + 網頁")
+        errors, failures = [f'product API: {api_error.reason}'], [api_error]
+        info = None
+        try:
+            info = self._basic(code)
+            if info is None:  # DLsite's basic info does not know this code either
+                self._service_ok()
+                return WorkInfo(404, WORK_PAGE.format(site=DEFAULT_SITE[code[:2]], code=code))
+        except SourceError as err:
+            errors.append(f'basic info: {err.reason}')
+            failures.append(err)
+        site = (info or {}).get('site_id') or DEFAULT_SITE[code[:2]]
+        page = None
+        try:
+            page = self._page(code, site)
+            if page is None:
+                errors.append('web page: no work page')
+        except SourceError as err:
+            errors.append(f'web page: {err.reason}')
+            failures.append(err)
+        url = WORK_PAGE.format(site=site, code=code)
+
+        if page:
+            fields = dict(page, site_id=site)
+            reason = 'product API unavailable; data from the web page'
+            if info:  # title always from the input code itself; fill gaps from basic info
+                fields['title'] = info.get('title') or page.get('title')
+                for key in ('work_age', 'release_date', 'img_url'):
+                    fields[key] = fields.get(key) or info.get(key)
+                if info.get('translation'):
+                    # A translation's page shows the ORIGINAL circle, but the rule is the input code's own
+                    # maker, which only the product API has: leave it unknown rather than write another circle.
+                    fields['circle'] = None
+                    reason += "; a translation's own circle is only in the product API"
+            self._service_ok()
+            return WorkInfo(200, url, fields, partial=reason)
+        if info:
+            result = WorkInfo(200, url, info, partial='product API and web page unavailable; only basic info')
+            self._service_failed(errors)
+            return result
+        return self._failed(code, errors, failures)
+
+    def _failed(self, code, errors, failures):
+        """No usable data at all."""
+        detail = '; '.join(errors)
+        blocked = [f.status for f in failures if f.status in BLOCKED_STATUSES]
+        if blocked:
+            result = WorkInfo(blocked[0], WORK_PAGE.format(site=DEFAULT_SITE[code[:2]], code=code), error=detail)
+        elif failures and all(f.status == 0 for f in failures):
+            result = WorkInfo(0, '', error=detail)
+        else:
+            result = WorkInfo(-2, '', error=detail)
+        self._service_failed(errors)
         return result
 
-    def _basic_info(self, code, otherwise, reason):
-        info = self._get(INFO_URL, {'product_id': code, 'cdn_cache_min': 1})
-        if info.status_code != 200:
-            return otherwise
-        data = info.json()
-        if not data:
-            return WorkInfo(404, otherwise.url)
-        if code not in data:
-            return otherwise
-        fields = fields_from_info(data[code])
-        return WorkInfo(200, WORK_PAGE.format(site=fields['site_id'], code=code), fields, partial=reason)
+    # -- circuit breakers -------------------------------------------------------
+    def _api_failed(self, err):
+        """After block_limit product API failures in a row, skip the API for the rest of the run."""
+        self.api_failures += 1
+        if self.api_failures >= self.block_limit and not self.api_down:
+            self.api_down = True
+            self.log(f"**作品資料 API 連續 {self.api_failures} 次失敗 ({err.reason}), "
+                     f"本次執行其餘作品改用基本資料 + 網頁")
 
-    def _not_blocked(self):
+    def _service_ok(self):
         self.blocked_streak = 0
         self.cooled_down = False
 
-    def _blocked(self):
-        """Circuit breaker: after block_limit blocked works in a row, cool down once; then stop."""
+    def _service_failed(self, errors):
+        """After block_limit works in a row without full data, cool down once; then stop."""
         self.blocked_streak += 1
         if self.blocked_streak < self.block_limit:
             return
         if self.cooled_down:
-            raise BatchAborted(f'DLsite still blocking after a {self.cooldown}s cool-down')
-        self.log(f"**連續 {self.blocked_streak} 個作品被 DLsite 拒絕, 暫停 {self.cooldown} 秒...")
+            raise BatchAborted(f'DLsite still unavailable after a {self.cooldown}s cool-down ({errors[-1]})')
+        self.log(f"**連續 {self.blocked_streak} 個作品無法從 DLsite 取得完整資料, 暫停 {self.cooldown} 秒...")
         self.sleep(self.cooldown)
         self.session = self._session_factory()
         self.cooled_down = True
-        self.blocked_streak = self.block_limit - 1  # one more blocked work after the pause stops the batch
+        self.api_down, self.api_failures = False, 0  # give the product API another chance
+        self.blocked_streak = self.block_limit - 1  # one more failure after the pause stops the batch
 
     def download_cover(self, img_url, store_path):
         """Download to a temporary file first, so a failed download never leaves a broken cover.jpg."""
@@ -500,7 +708,7 @@ class Options:
 
 
 # Order of categories in the end-of-run list (scratchpad 1.6)
-CATEGORIES = ['missing fields', 'name too long', 'not found', 'blocked', 'http error', 'network error',
+CATEGORIES = ['missing fields', 'name too long', 'not found', 'blocked', 'unavailable', 'http error', 'network error',
               'conflict', 'rename failed', 'error']
 
 
@@ -630,7 +838,7 @@ def _new_name_for(src, name, code, options, config, log, fetcher, cache, report,
             try:
                 cache[code] = fetcher.fetch(code)
             except BatchAborted as err:
-                log(f"**DLsite 持續拒絕連線, 停止查詢其餘作品: {err}")
+                log(f"**DLsite 持續無法使用, 停止查詢其餘作品: {err}")
                 cache['__aborted__'] = str(err)
                 cache[code] = WorkInfo(-1, '', None, error=str(err))
             except OSError as err:  # requests' network errors are OSError subclasses
@@ -644,10 +852,13 @@ def _new_name_for(src, name, code, options, config, log, fetcher, cache, report,
             log("**DLsite 上找不到本作!\n  請檢查本作是否已經下架, 尚未發售或被收入合集")
             report.add(code, 'not found', 'not on DLsite (removed, unreleased or merged into a bundle)', src)
         elif info.status == -1:
-            report.add(code, 'blocked', f'not looked up: {info.error}', src)
+            report.add(code, 'unavailable', f'not looked up: {info.error}', src)
         elif info.status in BLOCKED_STATUSES:
             log(f"**DLsite 拒絕連線 (HTTP {info.status}), 已重試仍失敗")
-            report.add(code, 'blocked', f'HTTP {info.status} after retries', src)
+            report.add(code, 'blocked', info.error or f'HTTP {info.status} after retries', src)
+        elif info.status == -2:
+            log(f"**無法從 DLsite 取得資料: {info.error}")
+            report.add(code, 'unavailable', info.error, src)
         elif info.status == 0:
             log("**請求失敗! 請檢查網絡連接")
             report.add(code, 'network error', info.error, src)

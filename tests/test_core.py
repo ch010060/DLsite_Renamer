@@ -322,7 +322,7 @@ class ProcessTest(unittest.TestCase):
         fetcher = AbortingFetcher({})
         report = self.run_process(fetcher)
         self.assertEqual(fetcher.calls, ['RJ111111'])  # no more requests after the abort
-        self.assertEqual(sorted(p.code for p in report.problems if p.category == 'blocked'),
+        self.assertEqual(sorted(p.code for p in report.problems if p.category == 'unavailable'),
                          ['RJ111111', 'RJ222222', 'RJ333333'])
         self.assertIn("note 'x'.txt", self.tree())  # local repair still runs
 
@@ -333,11 +333,13 @@ INFO = json.load(open(os.path.join(FIXTURES, 'product_info.json'), encoding='utf
 
 
 class FakeResponse:
-    def __init__(self, status, data=None, headers=None, body=b'img'):
+    def __init__(self, status, data=None, headers=None, body=b'img', url='fake', content=b'', not_json=False):
         self.status_code, self._data, self.headers, self._body = status, data, headers or {}, body
-        self.url = 'fake'
+        self.url, self.content, self._not_json = url, content, not_json
 
     def json(self):
+        if self._not_json:
+            raise ValueError('Expecting value: line 1 column 1 (char 0)')
         return self._data
 
     def iter_content(self, size):
@@ -350,13 +352,16 @@ class FakeSession:
         self.queue = queue
         self.calls = []
 
-    def get(self, url, params=None, timeout=None, stream=False):
-        kind = 'product' if 'product.json' in url else 'info' if 'info/ajax' in url else 'image'
+    def get(self, url, params=None, timeout=None, stream=False, allow_redirects=True):
+        kind = ('product' if 'product.json' in url else 'info' if 'info/ajax' in url
+                else 'page' if '/work/=/product_id/' in url else 'image')
         self.calls.append(kind)
+        if not self.queue.get(kind):
+            return FakeResponse(404)  # nothing queued: this source has nothing
         return self.queue[kind].pop(0)
 
 
-class ClientTest(unittest.TestCase):
+class ClientMixin:
     def client(self, **queue):
         self.sessions, self.sleeps, self.logs = [], [], []
         queue = {k: list(v) for k, v in queue.items()}
@@ -368,6 +373,8 @@ class ClientTest(unittest.TestCase):
         return core.DlsiteClient(log=self.logs.append, sleep=self.sleeps.append, session_factory=factory,
                                  backoff=(5, 15), block_limit=2, cooldown=300)
 
+
+class ClientTest(ClientMixin, unittest.TestCase):
     def test_fields_from_real_product_json(self):
         f = core.fields_from_product(PRODUCT['RJ01671271'])
         self.assertEqual((f['circle'], f['cv'], f['type'], f['work_age'], f['release_date'], f['site_id']),
@@ -428,7 +435,7 @@ class ClientTest(unittest.TestCase):
         c = self.client(product=[FakeResponse(403)] * 3, info=[FakeResponse(200, INFO)])
         info = c.fetch('RJ01700000')
         self.assertEqual((info.status, info.partial),
-                         (200, 'DLsite blocked the full data; only basic info was available'))
+                         (200, 'product API and web page unavailable; only basic info'))
         self.assertTrue(info.fields['title'].startswith('【繁体中文版】'))
         self.assertIsNone(info.fields['circle'])
         self.assertEqual(core.missing_fields(CONFIG_TEMPLATES['rj'], info.fields), ['cv'])
@@ -438,9 +445,10 @@ class ClientTest(unittest.TestCase):
         c = self.client(product=[FakeResponse(403)] * 3, info=[FakeResponse(403)] * 3)
         self.assertEqual(c.fetch('RJ123456').status, 403)
 
-    def test_other_http_error_no_retry(self):
-        c = self.client(product=[FakeResponse(500)])
-        self.assertEqual(c.fetch('RJ123456').status, 500)
+    def test_server_error_falls_back_without_backoff(self):
+        c = self.client(product=[FakeResponse(500)], info=[FakeResponse(200, [])])  # basic info: unknown code
+        info = c.fetch('RJ123456')
+        self.assertEqual((info.status, info.error), (404, ''))
         self.assertEqual(self.sleeps, [])
 
     def test_circuit_breaker(self):
@@ -491,6 +499,144 @@ class ClientTest(unittest.TestCase):
             self.assertEqual(os.listdir(d), [])  # no cover.jpg, no .part left behind
         finally:
             shutil.rmtree(d)
+
+
+PAGES = json.load(open(os.path.join(FIXTURES, 'work_pages.json'), encoding='utf-8'))
+
+
+def page_response(code):
+    p = PAGES[code]
+    return FakeResponse(p['status'], url=p['url'], content=p['html'].encode('utf-8'))
+
+
+def info_response(code, w):
+    return FakeResponse(200, {code: {'site_id': w['site_id'], 'work_name': w['work_name'],
+                                     'age_category': w['age_category'], 'regist_date': w['regist_date'],
+                                     'work_image': w['image_main']['url']}})
+
+
+class WebPageTest(unittest.TestCase):
+    """Phase 6: the web page is the fallback when product.json is unavailable."""
+
+    def test_page_fields_match_product_json(self):
+        # Real pages of both layouts give the same fields as product.json for the same works.
+        for code in ('RJ01386956', 'RJ01671271', 'VJ01001000', 'BJ100000', 'RJ01552342'):
+            page = core.parse_work_page(PAGES[code]['html'].encode('utf-8'))
+            api = core.fields_from_product(PRODUCT[code])
+            for key in ('title', 'circle', 'cv', 'author', 'type', 'release_date', 'img_url'):
+                if code == 'RJ01552342' and key == 'circle':
+                    continue  # translation: page shows the original circle (see test_translation_circle_unknown)
+                self.assertEqual(page[key], api[key], f'{code} {key}')
+            if code != 'BJ100000':  # the blpro page has no age row; basic info fills it in
+                self.assertEqual(page['work_age'], api['work_age'], code)
+
+    def test_layouts(self):
+        legacy = core.parse_work_page(PAGES['BJ100000']['html'].encode('utf-8'))
+        self.assertEqual((legacy['circle'], legacy['author']), ('CLLENN', ['戸池みすき']))  # 出版社名, no フォローする
+        new = core.parse_work_page(PAGES['VJ01001000']['html'].encode('utf-8'))
+        self.assertEqual((new['circle'], len(new['cv']), new['type']), ('アニム', 4, 'ゲーム'))  # ブランド名
+
+    def test_is_work_page(self):
+        self.assertTrue(core.is_work_page('https://www.dlsite.com/maniax/work/=/product_id/RJ01386956.html', 'RJ01386956'))
+        self.assertTrue(core.is_work_page(PAGES['RJ01700000']['url'], 'RJ01700000'))  # translation -> parent page
+        for url in ('https://www.comipo.app/product/BJ200000', 'https://www.dlsite.com/home/',
+                    'https://www.dlsite.com/maniax/work/=/product_id/RJ01386957.html', ''):
+            self.assertFalse(core.is_work_page(url, 'RJ01386956'), url)
+
+
+class ApiFailureTest(ClientMixin, unittest.TestCase):
+    """Phase 6: any product.json failure -> basic info + web page; clear reasons; breakers."""
+
+    def run_failure(self, product_response):
+        code = 'RJ01671271'
+        c = self.client(product=[product_response], info=[info_response(code, PRODUCT[code])],
+                        page=[page_response(code)])
+        return c.fetch(code)
+
+    def assert_full_from_page(self, info):
+        self.assertEqual((info.status, info.partial), (200, 'product API unavailable; data from the web page'))
+        self.assertEqual((info.fields['circle'], info.fields['cv']), ('エーテル@オメガバース専門サークル', ['三橋渡']))
+        self.assertEqual(core.missing_fields(CONFIG_TEMPLATES['rj'], info.fields), [])
+
+    def test_api_removed_404(self):
+        self.assert_full_from_page(self.run_failure(FakeResponse(404)))
+
+    def test_api_not_json(self):
+        self.assert_full_from_page(self.run_failure(FakeResponse(200, not_json=True)))
+
+    def test_api_format_changed(self):
+        self.assert_full_from_page(self.run_failure(FakeResponse(200, [{'name': 'x'}])))
+
+    def test_api_blocked_then_page(self):
+        self.assert_full_from_page(self.run_failure(FakeResponse(403)))   # back-off -> still 403 (queue empty->404)
+
+    def test_translation_title_from_own_code(self):
+        code = 'RJ01700000'  # page shows the parent RJ01699999; title must be the input code's own
+        c = self.client(product=[FakeResponse(404)], info=[info_response(code, PRODUCT[code])],
+                        page=[page_response(code)])
+        info = c.fetch(code)
+        self.assertEqual(info.fields['title'], PRODUCT[code]['work_name'])
+
+    def test_translation_circle_unknown(self):
+        code = 'RJ01552342'  # 【繁体中文版】; product API maker みんなで翻訳, page shows the original circle えもこ本舗
+        info_json = info_response(code, PRODUCT[code])
+        info_json._data[code]['translation_info'] = {'is_parent': True, 'is_child': False}
+        c = self.client(product=[FakeResponse(404)], info=[info_json], page=[page_response(code)])
+        info = c.fetch(code)
+        self.assertIsNone(info.fields['circle'])
+        self.assertIn("translation's own circle", info.partial)
+        self.assertEqual(core.missing_fields(CONFIG_TEMPLATES['rj'], info.fields), [])        # rj: no circle
+        self.assertEqual(core.missing_fields(CONFIG_TEMPLATES['vj'], info.fields), ['circle'])
+
+    def test_redirect_elsewhere_is_not_used(self):
+        code = 'BJ200000'
+        c = self.client(product=[FakeResponse(404)], info=[info_response(code, PRODUCT[code])],
+                        page=[FakeResponse(200, url='https://www.comipo.app/product/BJ200000', content=b'<h1>x</h1>')])
+        info = c.fetch(code)
+        self.assertEqual(info.partial, 'product API and web page unavailable; only basic info')
+        self.assertIsNone(info.fields['circle'])
+
+    def test_api_skipped_after_three_failures(self):
+        codes = ['RJ01386956', 'RJ01671271', 'VJ01001000', 'BJ100000']
+        c = self.client(product=[FakeResponse(404)] * 3,
+                        info=[info_response(k, PRODUCT[k]) for k in codes], page=[page_response(k) for k in codes])
+        for k in codes:
+            self.assertEqual(c.fetch(k).status, 200, k)
+        calls = [call for sess in self.sessions for call in sess.calls]
+        self.assertEqual(calls.count('product'), 2)  # block_limit=2: later works go straight to basic info + page
+        self.assertTrue(c.api_down)
+
+    def test_everything_down_is_reported_and_stops(self):
+        c = self.client(product=[FakeResponse(500)] * 9, info=[FakeResponse(500)] * 9, page=[FakeResponse(500)] * 9)
+        first = c.fetch('RJ111111')
+        self.assertEqual(first.status, -2)
+        self.assertIn('product API: HTTP 500', first.error)
+        self.assertIn('basic info: HTTP 500', first.error)
+        self.assertIn('web page: HTTP 500', first.error)
+        c.fetch('RJ222222')                      # 2nd failure -> cool-down
+        self.assertIn(300, self.sleeps)
+        with self.assertRaises(core.BatchAborted):
+            c.fetch('RJ333333')                  # still failing after the pause -> stop
+
+    def test_network_down(self):
+        def factory():
+            class Down:
+                calls = []
+                def get(self, *a, **k):
+                    raise ConnectionError('[Errno 61] Connection refused')
+            return Down()
+        c = core.DlsiteClient(log=lambda m: None, sleep=lambda s: None, session_factory=factory, block_limit=5)
+        info = c.fetch('RJ111111')
+        self.assertEqual(info.status, 0)
+        self.assertIn('network error', info.error)
+
+    def test_page_success_resets_breaker(self):
+        code = 'RJ01671271'
+        c = self.client(product=[FakeResponse(404)] * 5, info=[info_response(code, PRODUCT[code])] * 5,
+                        page=[page_response(code)] * 5)
+        for _ in range(5):
+            self.assertEqual(c.fetch(code).status, 200)
+        self.assertNotIn(300, self.sleeps)
 
 
 class ConfigTest(unittest.TestCase):
