@@ -919,11 +919,32 @@ class Report:
         return lines
 
 
+# Folders that belong to the OS / NAS / tools, never to the user's works: never entered, never renamed.
+SYSTEM_DIRS = {
+    '@eaDir', '#recycle', '#snapshot',                 # Synology (thumbnails / extended attributes, recycle bin)
+    '@Recycle', '@Recently-Snapshot',                  # QNAP
+    '$RECYCLE.BIN', 'System Volume Information',       # Windows
+}
+
+
+def is_skipped(name):
+    """Hidden entries (.git, .DS_Store, ._ AppleDouble, …) and OS/NAS system folders."""
+    return name.startswith('.') or name in SYSTEM_DIRS
+
+
 def iter_entries(root, recursive):
-    """(directory, name) pairs. Bottom-up, so a folder is handled after everything inside it."""
+    """(directory, name) pairs. Bottom-up, so a folder is handled after everything inside it.
+
+    Hidden and system folders are pruned: nothing inside them is visited (os.walk can only prune
+    top-down, so the walk is collected top-down and replayed in reverse).
+    """
     if recursive:
-        for dirpath, dirnames, filenames in os.walk(root, topdown=False, followlinks=False):
-            for name in sorted(filenames) + sorted(dirnames):
+        walked = []
+        for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+            dirnames[:] = sorted(d for d in dirnames if not is_skipped(d))
+            walked.append((dirpath, sorted(filenames), list(dirnames)))
+        for dirpath, filenames, dirnames in reversed(walked):
+            for name in filenames + dirnames:
                 yield dirpath, name
     else:
         for name in sorted(os.listdir(root)):
@@ -957,8 +978,8 @@ def process(root, options, config, log, fetcher=None, delay=None, asmr=None):
     log("選擇路徑: " + root + ("   [預覽模式]" if options.dry_run else "") + "\n")
 
     for directory, name in iter_entries(root, options.recursive):
-        if name.startswith('.'):
-            continue  # hidden files, including macOS ._ metadata
+        if is_skipped(name):
+            continue  # hidden files (incl. macOS ._ metadata) and OS/NAS system folders
         src = os.path.join(directory, name)
         if os.path.islink(src) and not os.path.exists(src):
             continue  # broken symlink

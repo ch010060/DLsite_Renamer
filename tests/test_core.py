@@ -298,6 +298,31 @@ class ProcessTest(unittest.TestCase):
         second = self.run_process(fetcher)
         self.assertEqual((second.shortened, second.renamed, second.unchanged), (0, 0, 1))
 
+    def test_hidden_and_system_folders_not_entered(self):  # PR #1 review (Codex P2) + Synology @eaDir
+        self.touch('.git', 'refs', 'heads', 'ｶﾞｲﾄﾞ')
+        self.touch('.git', 'objects', 'note "x".txt')
+        self.touch('@eaDir', 'RJ123456.zip@SynoEAStream')
+        self.touch('@eaDir', 'RJ123456.zip', 'SYNOPHOTO_THUMB_M.jpg')
+        self.touch('#recycle', 'RJ123456.zip')
+        self.touch('sub', '@eaDir', 'ｶﾞｲﾄﾞ.txt')
+        self.touch('sub', 'ｶﾞｲﾄﾞ.txt')
+        self.touch('RJ123456.zip')
+        before = [p for p in self.tree() if p.startswith(('.git', '@eaDir', '#recycle', 'sub/@eaDir'))]
+        fetcher = FakeFetcher({'RJ123456': dict(FIELDS, title='W')})
+        self.run_process(fetcher, recursive=True)
+        after = self.tree()
+        for path in before:
+            self.assertIn(path, after)                         # untouched
+        self.assertIn('sub/ガイド.txt', after)                   # visible entries still processed
+        self.assertIn('RJ123456 W (CV. 三橋渡,他).zip', after)
+        self.assertEqual(fetcher.calls, ['RJ123456'])            # nothing inside system folders looked up
+
+    def test_bottom_up_order_kept(self):
+        self.touch('A', 'B', 'f.txt')
+        order = [os.path.relpath(os.path.join(d, n), self.root) for d, n in core.iter_entries(self.root, True)]
+        self.assertLess(order.index('A/B/f.txt'), order.index('A/B'))
+        self.assertLess(order.index('A/B'), order.index('A'))
+
     def test_hidden_files_skipped(self):
         self.touch('._RJ123456"x".zip')
         fetcher = FakeFetcher({'RJ123456': FIELDS})
