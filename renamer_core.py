@@ -901,6 +901,7 @@ class Report:
     repaired: int = 0
     unchanged: int = 0
     shortened: int = 0
+    stopped: int = None   # number of items processed when the run was stopped, None = ran to the end
     problems: list = field(default_factory=list)
 
     def add(self, code, category, detail, path):
@@ -911,6 +912,8 @@ class Report:
         lines = ["===== 結果" + (" (預覽, 未更改任何檔案)" if dry_run else "") + " =====",
                  f"{verb}重命名: {self.renamed}   {verb}修復檔名: {self.repaired}   "
                  f"未變更: {self.unchanged}   標題已縮短: {self.shortened}"]
+        if self.stopped is not None:
+            lines.append(f"已停止 (處理了 {self.stopped} 個項目)")
         if self.problems:
             lines.append(f"\n未重命名 ({len(self.problems)}):")
             for p in sorted(self.problems, key=lambda p: CATEGORIES.index(p.category)):
@@ -961,11 +964,28 @@ def conflicts(src, dst):
         return True
 
 
-def process(root, options, config, log, fetcher=None, delay=None, asmr=None):
+def list_items(root, recursive):
+    """Paths the run will visit, in processing order (hidden/system entries and broken symlinks left out)."""
+    items = []
+    for directory, name in iter_entries(root, recursive):
+        path = os.path.join(directory, name)
+        if is_skipped(name) or (os.path.islink(path) and not os.path.exists(path)):
+            continue
+        items.append(path)
+    return items
+
+
+def process(root, options, config, log, fetcher=None, delay=None, asmr=None, progress=None, stop=None):
     """Rename DLsite works and repair every other visited name. Returns a Report.
 
     asmr: ASMR.ONE client for the second fallback; created automatically (if enabled in the config)
     only when fetcher is also created here, so tests with a fake fetcher never reach the network.
+    progress: optional callback(event, index, total, path, detail) for a GUI:
+        ('begin', 0, total, None, [paths])          before the first item
+        ('start', i, total, path, code or '')       an item starts (i = 0-based)
+        ('result', i, total, path, (status, text))  status: renamed / repaired / unchanged / problem;
+                                                    text: the new name, or "category: reason" for a problem
+    stop: optional threading.Event; when set, the run ends after the current item.
     """
     report = Report()
     if fetcher is None:
@@ -976,42 +996,26 @@ def process(root, options, config, log, fetcher=None, delay=None, asmr=None):
         delay = config.request_delay
     cache = {}
     log("選擇路徑: " + root + ("   [預覽模式]" if options.dry_run else "") + "\n")
+    items = list_items(root, options.recursive)
+    total = len(items)
+    if progress:
+        progress('begin', 0, total, None, items)
 
-    for directory, name in iter_entries(root, options.recursive):
-        if is_skipped(name):
-            continue  # hidden files (incl. macOS ._ metadata) and OS/NAS system folders
-        src = os.path.join(directory, name)
-        if os.path.islink(src) and not os.path.exists(src):
-            continue  # broken symlink
+    for index, src in enumerate(items):
+        if stop is not None and stop.is_set():
+            report.stopped = index
+            log(f"**已停止: 已處理 {index} / {total}")
+            break
+        directory, name = os.path.split(src)
         codes = find_work_codes(name)
         code = codes[0] if codes else None
+        if progress:
+            progress('start', index, total, src, code or '')
+        problems_before = len(report.problems)
+        result = ('unchanged', name)
         try:
-            if code is None:
-                new_name, kind = repair_name(name), 'repair'
-            else:
-                if len(codes) > 1:
-                    log(f"**名稱中有多個作品編號, 使用 {code}: {name}")
-                new_name, kind = _new_name_for(src, name, code, options, config, log, fetcher, cache, report,
-                                               delay, asmr)
-            if new_name == name:
-                report.unchanged += 1
-                continue
-            dst = os.path.join(directory, new_name)
-            if conflicts(src, dst):
-                log(f"**目標已存在, 跳過: {new_name}")
-                report.add(code, 'conflict', f'another item is already named "{new_name}"', src)
-                continue
-            label = "修復檔名" if kind == 'repair' else "重命名"
-            if kind == 'rename_shortened':
-                log(f"  標題已縮短以符合 {config.max_name_bytes} bytes 限制")
-                report.shortened += 1
-            log(f"  {'[預覽] ' if options.dry_run else ''}{label}: {name}\n    -> {new_name}")
-            if not options.dry_run:
-                os.rename(src, dst)
-            if kind != 'repair':
-                report.renamed += 1
-            else:
-                report.repaired += 1
+            result = _process_item(src, directory, name, codes, code, options, config, log, fetcher, cache,
+                                   report, delay, asmr)
         except OSError as err:
             if err.errno == errno.ENAMETOOLONG:
                 detail = 'name too long for this file system'
@@ -1022,11 +1026,46 @@ def process(root, options, config, log, fetcher=None, delay=None, asmr=None):
         except Exception as err:  # one bad item must never stop the run
             log(f"**處理時出現錯誤: {err!r}")
             report.add(code, 'error', repr(err), src)
+        if len(report.problems) > problems_before:  # this work was not renamed (its name may still be repaired)
+            last = report.problems[-1]
+            result = ('problem', f'{last.category}: {last.detail}')
+        if progress:
+            progress('result', index, total, src, result)
 
     for line in report.summary_lines(options.dry_run):
         log(line)
     log("*******完成!*******\n")
     return report
+
+
+def _process_item(src, directory, name, codes, code, options, config, log, fetcher, cache, report, delay, asmr):
+    """Rename or repair one item. Returns (status, new name); problems go to the report."""
+    if code is None:
+        new_name, kind = repair_name(name), 'repair'
+    else:
+        if len(codes) > 1:
+            log(f"**名稱中有多個作品編號, 使用 {code}: {name}")
+        new_name, kind = _new_name_for(src, name, code, options, config, log, fetcher, cache, report, delay, asmr)
+    if new_name == name:
+        report.unchanged += 1
+        return 'unchanged', name
+    dst = os.path.join(directory, new_name)
+    if conflicts(src, dst):
+        log(f"**目標已存在, 跳過: {new_name}")
+        report.add(code, 'conflict', f'another item is already named "{new_name}"', src)
+        return 'unchanged', name
+    label = "修復檔名" if kind == 'repair' else "重命名"
+    if kind == 'rename_shortened':
+        log(f"  標題已縮短以符合 {config.max_name_bytes} bytes 限制")
+        report.shortened += 1
+    log(f"  {'[預覽] ' if options.dry_run else ''}{label}: {name}\n    -> {new_name}")
+    if not options.dry_run:
+        os.rename(src, dst)
+    if kind == 'repair':
+        report.repaired += 1
+        return 'repaired', new_name
+    report.renamed += 1
+    return 'renamed', new_name
 
 
 def _new_name_for(src, name, code, options, config, log, fetcher, cache, report, delay, asmr=None):
