@@ -3,5 +3,6 @@ scratchpad.md
 
 __pycache__/
 
-# GUI: last used folder
+# GUI: last used folder and options
 .last_folder
+.gui_settings.json
