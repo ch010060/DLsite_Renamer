@@ -639,6 +639,168 @@ class ApiFailureTest(ClientMixin, unittest.TestCase):
         self.assertNotIn(300, self.sleeps)
 
 
+ASMR = json.load(open(os.path.join(FIXTURES, 'asmr_one.json'), encoding='utf-8'))
+
+
+class AsmrSession:
+    """Fake ASMR.ONE: per mirror host a list of responses; default 404."""
+    def __init__(self, plan):
+        self.plan, self.calls = plan, []
+
+    def get(self, url, timeout=None, **k):
+        host = url.split('//')[1].split('/')[0]
+        self.calls.append(host)
+        queue = self.plan.get(host)
+        if isinstance(queue, Exception):
+            raise queue
+        return queue.pop(0) if queue else FakeResponse(404)
+
+
+def asmr_ok(code):
+    return FakeResponse(200, ASMR[code])
+
+
+class AsmrOneTest(unittest.TestCase):
+    """Phase 7: ASMR.ONE as the second fallback (RJ/VJ voice works)."""
+
+    def client(self, plan):
+        self.sleeps, self.logs = [], []
+        self.session = AsmrSession(plan)
+        return core.AsmrOneClient(log=self.logs.append, sleep=self.sleeps.append, session_factory=lambda: self.session)
+
+    def test_fields_from_real_workinfo(self):
+        f = core.fields_from_asmr_one(ASMR['RJ01551365'])
+        self.assertEqual((f['circle'], f['cv'], f['type'], f['work_age'], f['release_date']),
+                         ('BrownDust2', ['安済知佳'], 'ボイス・ASMR', '全年齢', '260128'))
+        self.assertTrue(f['title'].startswith('【全面肯定'))                     # Chinese title on ASMR.ONE
+        self.assertTrue(f['img_url'].startswith('https://api.asmr-200.com/api/cover/'))
+        self.assertIsNone(f['author'])
+        self.assertEqual(core.fields_from_asmr_one(ASMR['RJ291235'])['work_age'], 'R-15')
+        self.assertEqual(core.fields_from_asmr_one(ASMR['RJ01082472'])['cv'], ['柊 結水', '柊結水'])  # exact dups only
+        tr = core.fields_from_asmr_one(ASMR['RJ01004652'])                     # translation: localized circle
+        self.assertEqual((tr['translation'], tr['circle']), (True, None))
+
+    def test_not_found_and_mirrors(self):
+        c = self.client({})
+        self.assertIsNone(c.work('RJ999999'))
+        self.assertEqual(self.session.calls, ['api.asmr-200.com'])               # 404 is authoritative
+        c = self.client({'api.asmr-200.com': ConnectionError('down'),
+                         'api.asmr.one': [FakeResponse(503)], 'api.asmr-100.com': [asmr_ok('RJ01551365')]})
+        self.assertEqual(c.work('RJ01551365')['circle'], 'BrownDust2')
+        self.assertEqual(self.session.calls, ['api.asmr-200.com', 'api.asmr.one', 'api.asmr-100.com'])
+
+    def test_rate_limit_then_ok(self):
+        c = self.client({'api.asmr-200.com': [FakeResponse(429, headers={'Retry-After': '3'}),
+                                              asmr_ok('RJ01551365')]})
+        self.assertIsNotNone(c.work('RJ01551365'))
+        self.assertEqual(self.sleeps, [3])
+
+    def test_unreachable_and_disabled_after_failures(self):
+        down = {m.split('//')[1]: ConnectionError('blocked') for m in core.ASMR_ONE_MIRRORS}
+        c = self.client(down)
+        for _ in range(3):
+            with self.assertRaises(core.SourceError):
+                c.work('RJ01551365')
+        self.assertTrue(c.down)
+        n = len(self.session.calls)
+        with self.assertRaises(core.SourceError):
+            c.work('RJ01551365')
+        self.assertEqual(len(self.session.calls), n)                              # skipped: no more requests
+
+    def test_other_work_is_ignored(self):
+        c = self.client({'api.asmr-200.com': [asmr_ok('RJ01551365')]})
+        self.assertIsNone(c.work('RJ01082472'))                                    # answer is a different work
+
+    # -- merge (with_asmr_one) --------------------------------------------------
+    def merged(self, code, info, template=CONFIG_TEMPLATES['rj'], plan=None, want_cover=False):
+        if plan is None:
+            plan = {'api.asmr-200.com': [asmr_ok(code)]} if code in ASMR else {}
+        c = self.client(plan)
+        return core.with_asmr_one(code, info, template, c, {}, self.logs.append, want_cover)
+
+    def test_dlsite_not_found_uses_asmr_one(self):          # the "no longer sold / gone" special case
+        info = self.merged('RJ01551365', core.WorkInfo(404, ''))
+        self.assertEqual(info.status, 200)
+        self.assertTrue(info.partial.startswith('data from ASMR.ONE'))
+        self.assertTrue(info.fields['title'].startswith('【全面肯定'))              # (a): ASMR.ONE title + warning
+        self.assertTrue(any('標題來自 ASMR.ONE' in l for l in self.logs))
+        self.assertEqual(core.missing_fields(CONFIG_TEMPLATES['rj'], info.fields), [])
+
+    def test_basic_info_title_wins(self):
+        basic = core.fields_from_info({'work_name': 'DLsite の題名', 'age_category': 1, 'regist_date': None,
+                                       'site_id': 'home', 'work_image': ''})
+        info = self.merged('RJ01551365', core.WorkInfo(200, 'u', basic, partial='DLsite has only basic info'))
+        self.assertEqual(info.fields['title'], 'DLsite の題名')
+        self.assertEqual((info.fields['circle'], info.fields['cv']), ('BrownDust2', ['安済知佳']))
+        self.assertEqual(info.fields['work_age'], '全年齢')
+
+    def test_translation_circle_stays_unknown(self):
+        info = self.merged('RJ01004652', core.WorkInfo(404, ''))
+        self.assertIsNone(info.fields['circle'])
+        self.assertEqual(core.missing_fields(CONFIG_TEMPLATES['vj'], info.fields), ['circle'])
+
+    def test_full_dlsite_without_cv_gets_cv_only(self):
+        dl = core.fields_from_product(PRODUCT['RJ01386956'])  # full DLsite data, no CV
+        info = self.merged('RJ01386956', core.WorkInfo(200, 'u', dl),
+                           plan={'api.asmr-200.com': [FakeResponse(200, dict(ASMR['RJ105661'], source_id='RJ01386956'))]})
+        self.assertEqual(info.fields['cv'], ['蒼紗', 'さくら真咲'])
+        self.assertEqual({k: v for k, v in info.fields.items() if k != 'cv'}, {k: v for k, v in dl.items() if k != 'cv'})
+        self.assertEqual(info.partial, '')
+
+    def test_full_dlsite_with_cv_or_no_cv_template_not_asked(self):
+        dl = core.fields_from_product(PRODUCT['RJ01671271'])                       # has CV
+        info = self.merged('RJ01671271', core.WorkInfo(200, 'u', dl))
+        self.assertIs(info.fields, dl)
+        self.assertEqual(self.session.calls, [])
+        dl = core.fields_from_product(PRODUCT['RJ01386956'])                       # no CV, template without cv
+        self.merged('RJ01386956', core.WorkInfo(200, 'u', dl), template='workno title ')
+        self.assertEqual(self.session.calls, [])
+
+    def test_full_dlsite_without_cover_gets_cover_only(self):
+        dl = dict(core.fields_from_product(PRODUCT['RJ01671271']), img_url='')     # e.g. DLsite no-image placeholder
+        asmr = FakeResponse(200, dict(ASMR['RJ01551365'], source_id='RJ01671271'))
+        info = self.merged('RJ01671271', core.WorkInfo(200, 'u', dl), plan={'api.asmr-200.com': [asmr]},
+                           want_cover=True)
+        self.assertTrue(info.fields['img_url'].startswith('https://api.asmr-200.com/api/cover/'))
+        self.assertEqual(info.fields['cv'], ['三橋渡'])                              # DLsite CV kept
+        self.assertTrue(any('封面來自 ASMR.ONE' in l for l in self.logs))
+        info = self.merged('RJ01671271', core.WorkInfo(200, 'u', dl), want_cover=False)  # covers not requested
+        self.assertEqual(self.session.calls, [])
+
+    def test_merge_fills_cover(self):
+        info = self.merged('RJ01551365', core.WorkInfo(404, ''))
+        self.assertTrue(info.fields['img_url'].startswith('https://api.asmr-200.com/api/cover/'))
+
+    def test_only_rj_vj(self):
+        for code in ('BJ100000', 'RE100000'):
+            info = core.WorkInfo(404, '')
+            self.assertIs(self.merged(code, info), info)
+            self.assertEqual(self.session.calls, [])
+
+    def test_asmr_one_also_fails(self):
+        down = {m.split('//')[1]: ConnectionError('blocked') for m in core.ASMR_ONE_MIRRORS}
+        info = self.merged('RJ01551365', core.WorkInfo(-2, '', error='product API: HTTP 500'), plan=down)
+        self.assertEqual(info.status, -2)
+        self.assertIn('ASMR.ONE unavailable', info.error)
+
+    def test_process_end_to_end(self):
+        root = tempfile.mkdtemp()
+        try:
+            open(os.path.join(root, 'RJ01551365.zip'), 'w').close()
+            open(os.path.join(root, 'BJ999999.zip'), 'w').close()
+            asmr = self.client({'api.asmr-200.com': [asmr_ok('RJ01551365')]})
+            report = core.process(root, core.Options(), core.Config(templates=dict(CONFIG_TEMPLATES)),
+                                  self.logs.append, FakeFetcher({}), delay=0, asmr=asmr)
+            self.assertIn('RJ01551365 【全面肯定・幼儿退化ASMR】宝宝的治愈时光～被泰瑞丝娇惯养大～【棕色尘埃2】 (CV. 安済知佳).zip',
+                          os.listdir(root))
+            self.assertEqual([p.code for p in report.problems], ['BJ999999'])      # BJ: no ASMR.ONE lookup
+        finally:
+            shutil.rmtree(root)
+
+    def test_config_flag(self):
+        self.assertTrue(core.Config().asmr_one_fallback)
+
+
 class ConfigTest(unittest.TestCase):
     def test_bad_json_uses_defaults(self):
         d = tempfile.mkdtemp()

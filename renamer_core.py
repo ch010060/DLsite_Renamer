@@ -234,6 +234,7 @@ class Config:
                                                      'vj': DEFAULT_TEMPLATE})
     max_name_bytes: int = DEFAULT_MAX_NAME_BYTES
     request_delay: float = DEFAULT_REQUEST_DELAY   # seconds between DLsite requests (plus random jitter)
+    asmr_one_fallback: bool = True                 # second fallback: ASMR.ONE (RJ/VJ voice works)
 
     def template_for(self, code):
         prefix = code[:2].lower()
@@ -272,6 +273,8 @@ def load_config(basedir, log):
             cfg.max_name_bytes = int(config['max_name_bytes'])
         if 'request_delay' in config:
             cfg.request_delay = float(config['request_delay'])
+        if 'asmr_one_fallback' in config:
+            cfg.asmr_one_fallback = bool(config['asmr_one_fallback'])
     except (OSError, ValueError, TypeError, AttributeError) as err:
         log(f"**配置文件讀取失敗, 使用默認設定: {err}\n")
         return Config()
@@ -697,6 +700,160 @@ class DlsiteClient:
 
 
 # ---------------------------------------------------------------------------
+# ASMR.ONE (Phase 7): second fallback for RJ/VJ voice works when DLsite cannot give the work info.
+# API notes: /Volumes/KioxiaG2/github/asmr.one-downloader/scratchpad.md ("ASMR.ONE API — full processing workflow").
+# ---------------------------------------------------------------------------
+ASMR_ONE_MIRRORS = ('https://api.asmr-200.com', 'https://api.asmr.one', 'https://api.asmr-100.com',
+                    'https://api.asmr-300.com')
+ASMR_ONE_PREFIXES = ('RJ', 'VJ')
+# DLsite work_type code (found in ASMR.ONE work_attributes) -> DLsite label; verified against product.json.
+WORK_TYPE_LABELS = {
+    'SOU': 'ボイス・ASMR', 'MUS': '音楽', 'AMT': '音素材', 'IMT': '画像素材', 'ICG': 'CG・イラスト', 'MNG': 'マンガ',
+    'TOL': 'ツール/アクセサリ', 'ETC': 'その他', 'ET3': 'その他', 'ACN': 'アクション', 'ADV': 'アドベンチャー',
+    'RPG': 'ロールプレイング', 'SLN': 'シミュレーション', 'DNV': 'デジタルノベル', 'TBL': 'テーブル',
+}
+ASMR_ONE_AGES = {'general': '全年齢', 'r15': 'R-15', 'adult': 'R18'}
+
+
+def fields_from_asmr_one(w):
+    """Fields from an ASMR.ONE workInfo response (no author; the title may be a Chinese translation)."""
+    attrs = str(w.get('work_attributes') or '').split(',')
+    code = next((a for a in attrs if a in WORK_TYPE_LABELS), None)
+    circle = (w.get('circle') or {}).get('name') or w.get('name') or None
+    cv = []
+    for v in w.get('vas') or []:
+        name = v.get('name') if isinstance(v, dict) else None
+        if name and name not in cv:
+            cv.append(name)
+    translation = _is_translation(w.get('translation_info'))
+    return {
+        'title': w.get('title') or None,
+        'circle': None if translation else circle,  # a translation's circle name is localized on ASMR.ONE
+        'cv': cv,
+        'author': None,
+        'type': _work_type(WORK_TYPE_LABELS[code]) if code else None,
+        'work_age': ASMR_ONE_AGES.get(w.get('age_category_string')),
+        'release_date': _yymmdd(w.get('release')),
+        'img_url': w.get('mainCoverUrl') or '',
+        'translation': translation,
+    }
+
+
+class AsmrOneClient:
+    """ASMR.ONE workInfo lookup over its mirrors. 404 = not on ASMR.ONE (authoritative)."""
+
+    def __init__(self, log=print, sleep=time.sleep, timeout=(5, 20), fail_limit=3, session_factory=None,
+                 mirrors=ASMR_ONE_MIRRORS):
+        self.log, self.sleep, self.timeout, self.fail_limit, self.mirrors = log, sleep, timeout, fail_limit, mirrors
+        self.session = (session_factory or self._make_session)()
+        self.failures = 0
+        self.down = False
+
+    @staticmethod
+    def _make_session():
+        import requests
+        session = requests.Session()
+        session.headers.update({'User-Agent': FALLBACK_UA, 'Accept': 'application/json',
+                                'Referer': 'https://asmr.one/', 'Origin': 'https://asmr.one'})
+        return session
+
+    def work(self, code):
+        """Fields for code, or None if ASMR.ONE does not have it. Raises SourceError if unreachable."""
+        if self.down:
+            raise SourceError(-2, 'skipped (ASMR.ONE failed earlier in this run)')
+        errors = []
+        for base in self.mirrors:
+            host = base.split('//')[1]
+            for attempt in range(3):
+                try:
+                    r = self.session.get(f'{base}/api/workInfo/{code}', timeout=self.timeout)
+                except OSError as err:
+                    errors.append(f'{host}: network error ({err.__class__.__name__})')
+                    break
+                if r.status_code == 404:
+                    self.failures = 0
+                    return None
+                if r.status_code == 429 and attempt < 2:
+                    value = r.headers.get('Retry-After', '')
+                    self.sleep(min(int(value), 60) if value.isdigit() else 4 * 2 ** attempt)
+                    continue
+                if r.status_code != 200:
+                    errors.append(f'{host}: HTTP {r.status_code}')
+                    break
+                try:
+                    w = r.json()
+                except ValueError:
+                    errors.append(f'{host}: not JSON')
+                    break
+                if not isinstance(w, dict) or not w.get('title'):
+                    errors.append(f'{host}: unexpected format')
+                    break
+                self.failures = 0
+                if str(w.get('source_id') or code).upper() != code:
+                    return None  # resolved to a different work: not this one
+                return fields_from_asmr_one(w)
+        self.failures += 1
+        if self.failures >= self.fail_limit and not self.down:
+            self.down = True
+            self.log(f"**ASMR.ONE 連續 {self.failures} 次無法連線, 本次執行不再使用 (可能有地區限制)")
+        raise SourceError(-2, 'ASMR.ONE unavailable: ' + '; '.join(errors))
+
+
+def with_asmr_one(code, info, template, asmr, cache, log, want_cover=False):
+    """Second fallback (Phase 7): fill what DLsite could not give from ASMR.ONE.
+
+    - DLsite gave no full data (any reason) -> merge: DLsite fields first, ASMR.ONE fills the gaps (cover included).
+    - DLsite gave full data but no CV (template uses cv) and/or no cover (want_cover) -> only those from ASMR.ONE.
+    """
+    if asmr is None or code[:2] not in ASMR_ONE_PREFIXES:
+        return info
+    full = info.status == 200 and not info.partial
+    need_cv = full and not info.fields.get('cv') and 'cv' in KEYWORDS.findall(template)
+    need_cover = full and want_cover and not info.fields.get('img_url')
+    if full and not (need_cv or need_cover):
+        return info
+    key = 'asmr.one:' + code
+    if key not in cache:
+        try:
+            cache[key] = asmr.work(code)
+        except SourceError as err:
+            cache[key] = err
+    found = cache[key]
+    if not isinstance(found, dict):
+        note = 'not on ASMR.ONE' if found is None else found.reason
+        if not full:
+            log(f"  ASMR.ONE: {note}")
+            if info.status == 200:
+                return WorkInfo(info.status, info.url, info.fields, info.error, f'{info.partial}; {note}')
+            return WorkInfo(info.status, info.url, info.fields, f'{info.error}; {note}' if info.error else info.error)
+        return info
+    if full:
+        fields = dict(info.fields)
+        if need_cv and found['cv']:
+            fields['cv'] = found['cv']
+            log("  CV 來自 ASMR.ONE (DLsite 沒有 CV 資料)")
+        if need_cover and found['img_url']:
+            fields['img_url'] = found['img_url']
+            log("  封面來自 ASMR.ONE (DLsite 沒有封面)")
+        return info if fields == info.fields else WorkInfo(200, info.url, fields)
+
+    base = info.fields if info.status == 200 and info.fields else {}
+    fields = {k: base.get(k) or found.get(k) for k in ('circle', 'type', 'work_age', 'release_date', 'img_url')}
+    fields['title'] = base.get('title') or found['title']
+    if not base.get('title'):
+        log("**標題來自 ASMR.ONE, 可能與 DLsite 不同 (例如中文標題)")
+    fields['cv'] = base.get('cv') or found['cv']
+    fields['author'] = base.get('author')
+    fields['site_id'] = base.get('site_id')
+    if base.get('translation') or found['translation']:
+        fields['circle'] = base.get('circle')  # only DLsite's own maker name is valid for a translation
+    dlsite = info.partial or info.error or ('not found' if info.status == 404 else f'HTTP {info.status}')
+    log("  資料來源: ASMR.ONE (DLsite: " + dlsite + ")")
+    url = info.url or WORK_PAGE.format(site='maniax', code=code)
+    return WorkInfo(200, url, fields, partial=f'data from ASMR.ONE; DLsite: {dlsite}')
+
+
+# ---------------------------------------------------------------------------
 # Processing
 # ---------------------------------------------------------------------------
 @dataclass
@@ -765,11 +922,17 @@ def conflicts(src, dst):
         return True
 
 
-def process(root, options, config, log, fetcher=None, delay=None):
-    """Rename DLsite works and repair every other visited name. Returns a Report."""
+def process(root, options, config, log, fetcher=None, delay=None, asmr=None):
+    """Rename DLsite works and repair every other visited name. Returns a Report.
+
+    asmr: ASMR.ONE client for the second fallback; created automatically (if enabled in the config)
+    only when fetcher is also created here, so tests with a fake fetcher never reach the network.
+    """
     report = Report()
     if fetcher is None:
         fetcher = DlsiteClient(log=log)
+        if asmr is None and config.asmr_one_fallback:
+            asmr = AsmrOneClient(log=log)
     if delay is None:
         delay = config.request_delay
     cache = {}
@@ -790,7 +953,7 @@ def process(root, options, config, log, fetcher=None, delay=None):
                 if len(codes) > 1:
                     log(f"**名稱中有多個作品編號, 使用 {code}: {name}")
                 new_name, kind = _new_name_for(src, name, code, options, config, log, fetcher, cache, report,
-                                               delay)
+                                               delay, asmr)
             if new_name == name:
                 report.unchanged += 1
                 continue
@@ -827,7 +990,7 @@ def process(root, options, config, log, fetcher=None, delay=None):
     return report
 
 
-def _new_name_for(src, name, code, options, config, log, fetcher, cache, report, delay):
+def _new_name_for(src, name, code, options, config, log, fetcher, cache, report, delay, asmr=None):
     """Return (new_name, kind); kind is 'rename' / 'rename_shortened' (from the template) or 'repair'."""
     log('Processing: ' + code)
 
@@ -845,7 +1008,9 @@ def _new_name_for(src, name, code, options, config, log, fetcher, cache, report,
                 cache[code] = WorkInfo(0, '', None, error=str(err))
             if delay:
                 time.sleep(delay + random.uniform(0, delay / 2))  # be polite to the server
-    info = cache[code]
+    template = config.template_for(code)
+    want_cover = options.download_cover and not options.dry_run and os.path.isdir(src)
+    info = with_asmr_one(code, cache[code], template, asmr, cache, log, want_cover)
 
     if info.status != 200:
         if info.status == 404:
@@ -883,7 +1048,6 @@ def _new_name_for(src, name, code, options, config, log, fetcher, cache, report,
             except OSError as err:
                 log(f"**下載封面過程中出現錯誤! {err}")
 
-    template = config.template_for(code)
     missing = missing_fields(template, fields)
     if missing:
         log("**缺少欄位, 不重命名: " + ', '.join(missing))

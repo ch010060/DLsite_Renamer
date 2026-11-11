@@ -82,13 +82,15 @@ After：(ゲーム)(全年齢)[150417][VJ009178][Falcom] 英雄伝説 零の軌�
 {
 	"replace_rules": [ ... ],
 	"max_name_bytes": 255,
-	"request_delay": 1.0
+	"request_delay": 1.0,
+	"asmr_one_fallback": true
 }
 ```
 - `max_name_bytes`: longest file/folder name in UTF-8 bytes (default 255, safe for Windows and Linux NAS shares).
   If a new name is longer, only the **title** is shortened; the work code, `(CV. xxx)`, other fields and the
   extension are kept. Lower it for special shares (e.g. 143 for Synology encrypted folders).
 - `request_delay`: seconds between DLsite requests (default 1.0, plus a small random delay).
+- `asmr_one_fallback`: use ASMR.ONE as the second fallback for RJ/VJ works (default `true`; `false` to turn it off).
 
 ### Notice：
 1. Please modify the config.json under **UTF-8**.
@@ -114,7 +116,13 @@ After：(ゲーム)(全年齢)[150417][VJ009178][Falcom] 英雄伝説 零の軌�
    circle are listed, not renamed. After 3 product-data failures in a row the rest of the run uses the fallback
    directly. After 3 works in a row without full data from any source it pauses 5 minutes; if still failing,
    it stops asking DLsite and lists the remaining works.
-10. In recursive mode, files inside a work folder keep their own names unless they contain a work code themselves.
+10. Second fallback — ASMR.ONE (RJ/VJ voice works, `asmr_one_fallback`): used whenever DLsite cannot give the
+    full work info for any reason (not found, no longer sold, only basic info, outage). DLsite data always wins;
+    ASMR.ONE fills the gaps (circle, CV, type, date, age, cover). If DLsite has no title at all, the ASMR.ONE title
+    is used and may be a Chinese translation (a warning is logged). It is also asked for the CV when DLsite lists
+    none, and for the cover when DLsite has none. Translations keep the circle unknown; there is no author.
+    ASMR.ONE may be region-blocked outside East Asia; after 3 failures in a row it is skipped for the run.
+11. In recursive mode, files inside a work folder keep their own names unless they contain a work code themselves.
 
 ### (Optional) CLI version without GUI and loop：
 ```
