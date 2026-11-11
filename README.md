@@ -105,10 +105,13 @@ After：(ゲーム)(全年齢)[150417][VJ009178][Falcom] 英雄伝説 零の軌�
    (e.g. U+F022) → fullwidth form, no trailing space or dot. Hidden files (`.xxx`, `._xxx`) are not touched.
 6. Preview (dry-run): tick「預覽（不重命名）」in the GUI or use `-n` in the CLI to see every new name without
    renaming anything or downloading covers.
-   GUI: choose the folder (or type the path), then press「開始」. The work list shows every item with its status
-   (等待 / 處理中 / 已重命名 / 修復 / 未變更 / ✖ 未重命名 with the reason), plus a progress bar and percentage.
-   「只顯示問題」shows only the works that were not renamed;「停止」ends the run after the current item.
-   The full log is hidden; click「日誌」to open it (the label shows the error count).
+   GUI (dark theme): choose the folder (or type the path), then press「▶ 開始」. The status banner shows the state
+   (READY / 執行中 / 完成 / 已停止), the current item and the counts. The work list shows every item with its status
+   (等待 / 處理中 / 已重命名 / 修復 / 未變更 / ✖ 未重命名 with the reason); the search box filters it by work code or
+   name, and「只顯示問題」shows only the works that were not renamed.「■ 停止」ends the run after the current item.
+   Tick「顯示日誌」to see the full log (the label shows the error count). The progress bar shows `12 / 40 (30%)`.
+   「去除【】」and「下載封面」are on by default; the last folder and options are remembered (`.gui_settings.json`).
+   The window sizes itself to its content, so it also fits at high Windows display scaling.
 7. An existing file is never overwritten; the conflict is listed instead.
 8. Works that are not renamed are listed at the end with the reason (missing fields, not found, blocked,
    name too long, conflict, error). The CLI exits with code 1 when the list is not empty.
@@ -132,7 +135,7 @@ After：(ゲーム)(全年齢)[150417][VJ009178][Falcom] 英雄伝説 零の軌�
 ```
 usage: dlsite_renamer-cli.py [-h] [-d] [-c] [-r] [-n] -i PATH
 
-Renamer for DLsite works v4.2
+Renamer for DLsite works v4.3
 
 options:
   -h, --help            show this help message and exit
