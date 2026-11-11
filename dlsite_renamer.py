@@ -29,6 +29,8 @@ stop_event = threading.Event()
 rows = {}         # path -> tree item id
 order = []        # tree item ids in processing order
 status_of = {}    # tree item id -> status
+counts = {s: 0 for s in STATUS}  # rows per status, kept up to date by set_status (no rescans)
+PUMP_BATCH = 300  # queued messages handled per pump, so a burst of events cannot freeze the window
 preview = False   # the current run is a dry-run
 log_open = False  # the log section is shown (tracked here: winfo_ismapped lags behind on macOS)
 
@@ -50,7 +52,7 @@ def call_in_ui(func, *args):
 
 def pump_ui():
     try:
-        while True:
+        for _ in range(PUMP_BATCH):
             item = ui_queue.get_nowait()
             if item[0] == 'log':
                 append_log(item[1])
@@ -59,8 +61,9 @@ def pump_ui():
             else:
                 item[1](*item[2])
     except queue.Empty:
-        pass
-    root.after(50, pump_ui)
+        root.after(50, pump_ui)
+        return
+    root.after(1, pump_ui)  # more waiting: continue right after Tk handles input and redraws
 
 
 def append_log(message):
@@ -73,6 +76,8 @@ def on_progress(event, index, total, path, detail):
     if event == 'begin':
         tree.delete(*tree.get_children())
         rows.clear(), order.clear(), status_of.clear()
+        counts.update({s: 0 for s in STATUS})
+        counts['waiting'] = len(detail)
         bar.config(maximum=max(total, 1), value=0)
         for p in detail:
             name = os.path.basename(p)
@@ -80,6 +85,8 @@ def on_progress(event, index, total, path, detail):
             iid = tree.insert('', 'end', values=(STATUS['waiting'][0], codes[0] if codes else '—', name))
             rows[p], status_of[iid] = iid, 'waiting'
             order.append(iid)
+        if only_problems.get():
+            apply_filter()
         update_counts(0, total)
     elif event == 'start':
         iid = rows[path]
@@ -100,9 +107,15 @@ def set_status(iid, status, result_text=None):
     if result_text is not None:
         values[2] = result_text
     tree.item(iid, values=values, tags=(STATUS[status][2],))
+    counts[status_of[iid]] -= 1
+    counts[status] += 1
     status_of[iid] = status
     if only_problems.get():
-        apply_filter()
+        # results arrive in processing order, so a new ✖ row belongs at the end; others are hidden
+        if status == 'problem':
+            tree.move(iid, '', 'end')
+        else:
+            tree.detach(iid)
 
 
 def apply_filter():
@@ -118,19 +131,15 @@ def apply_filter():
 def update_counts(done, total):
     pct = done * 100 // total if total else 100
     count.set(f"{done} / {total} ({pct}%)")
-    counted = {s: 0 for s in STATUS}
-    for s in status_of.values():
-        counted[s] += 1
     verb = '將' if preview else '已'
-    summary.set(f"{verb}重命名 {counted['renamed']} · {verb}修復 {counted['repaired']} · "
-                f"未變更 {counted['unchanged']} · 未重命名 {counted['problem']}")
-    update_log_toggle(counted['problem'])
+    summary.set(f"{verb}重命名 {counts['renamed']} · {verb}修復 {counts['repaired']} · "
+                f"未變更 {counts['unchanged']} · 未重命名 {counts['problem']}")
+    update_log_toggle()
 
 
 # -- log section (hidden by default) ------------------------------------------------------------------
-def update_log_toggle(errors=None):
-    if errors is None:
-        errors = sum(1 for s in status_of.values() if s == 'problem')
+def update_log_toggle():
+    errors = counts['problem']
     arrow = '▾' if log_open else '▸'
     log_toggle.config(text=f"日誌 {arrow}" + (f" ({errors} 個錯誤)" if errors else ''),
                       foreground='red' if errors else '')
