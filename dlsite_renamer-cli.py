@@ -4,7 +4,7 @@ import sys
 
 import renamer_core as core
 
-VERSION = '4.1'
+VERSION = '4.2'
 
 
 def dir_path(path):

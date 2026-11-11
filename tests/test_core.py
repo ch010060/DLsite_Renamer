@@ -323,6 +323,45 @@ class ProcessTest(unittest.TestCase):
         self.assertLess(order.index('A/B/f.txt'), order.index('A/B'))
         self.assertLess(order.index('A/B'), order.index('A'))
 
+    def test_progress_events(self):  # Phase 8: GUI work list
+        self.touch('RJ123456.zip')       # renamed
+        self.touch('VJ111111.zip')       # missing circle -> problem
+        self.touch('ｶﾞｲﾄﾞ.txt')           # repaired
+        self.touch('plain.txt')          # unchanged
+        self.touch('.DS_Store')          # never listed
+        events = []
+        fetcher = FakeFetcher({'RJ123456': dict(FIELDS, title='W'), 'VJ111111': dict(FIELDS, circle=None)})
+        core.process(self.root, core.Options(), self.config, self.log.append, fetcher, delay=0,
+                     progress=lambda *e: events.append(e))
+        begin = events[0]
+        self.assertEqual(begin[:3], ('begin', 0, 4))
+        self.assertEqual([os.path.basename(p) for p in begin[4]],
+                         ['RJ123456.zip', 'VJ111111.zip', 'plain.txt', 'ｶﾞｲﾄﾞ.txt'])
+        starts = [e for e in events if e[0] == 'start']
+        self.assertEqual([e[4] for e in starts], ['RJ123456', 'VJ111111', '', ''])
+        results = {os.path.basename(e[3]): e[4] for e in events if e[0] == 'result'}
+        self.assertEqual(results['RJ123456.zip'], ('renamed', 'RJ123456 W (CV. 三橋渡,他).zip'))
+        self.assertEqual(results['VJ111111.zip'], ('problem', 'missing fields: circle'))
+        self.assertEqual(results['ｶﾞｲﾄﾞ.txt'], ('repaired', 'ガイド.txt'))
+        self.assertEqual(results['plain.txt'], ('unchanged', 'plain.txt'))
+
+    def test_stop_after_current_item(self):
+        import threading
+        for n in ('RJ111111.zip', 'RJ222222.zip', 'RJ333333.zip'):
+            self.touch(n)
+        stop = threading.Event()
+        fetcher = FakeFetcher({k: dict(FIELDS, title='W' + k) for k in ('RJ111111', 'RJ222222', 'RJ333333')})
+
+        def progress(event, index, total, path, detail):
+            if event == 'result' and index == 0:
+                stop.set()                                   # user pressed 停止 during the first item
+        report = core.process(self.root, core.Options(), self.config, self.log.append, fetcher, delay=0,
+                              progress=progress, stop=stop)
+        self.assertEqual((report.renamed, report.stopped), (1, 1))
+        self.assertEqual(fetcher.calls, ['RJ111111'])           # nothing after the stop
+        self.assertIn('RJ222222.zip', self.tree())
+        self.assertTrue(any('已停止' in line for line in self.log))
+
     def test_hidden_files_skipped(self):
         self.touch('._RJ123456"x".zip')
         fetcher = FakeFetcher({'RJ123456': FIELDS})
