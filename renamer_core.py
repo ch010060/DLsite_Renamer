@@ -5,6 +5,7 @@ The design notes are in scratchpad.md (sections 1.1 - 1.11).
 import errno
 import json
 import os
+import random
 import re
 import time
 import unicodedata
@@ -108,9 +109,15 @@ def prepare_template(template, fields):
 
 
 def missing_fields(template, fields):
-    """Scraped fields the template uses but DLsite did not provide."""
+    """Fields the template uses but DLsite did not provide.
+
+    An empty CV/author list is normal (the template's "(CV. cv)" / "(author)" is removed);
+    None means unknown (only basic data was available), which counts as missing.
+    """
+    raw = set(KEYWORDS.findall(template))
     used = set(KEYWORDS.findall(prepare_template(template, fields)))
-    return [k for k in SCRAPED_KEYWORDS if k in used and not fields.get(k)]
+    missing = [k for k in SCRAPED_KEYWORDS if k in used and not fields.get(k)]
+    return missing + [k for k in ('cv', 'author') if k in raw and fields.get(k) is None]
 
 
 def _render(template, values):
@@ -165,6 +172,7 @@ def build_name(template, code, fields, ext, max_bytes):
 # ---------------------------------------------------------------------------
 DEFAULT_TEMPLATE = 'workno title '
 DEFAULT_MAX_NAME_BYTES = 255
+DEFAULT_REQUEST_DELAY = 1.0
 
 
 @dataclass
@@ -172,6 +180,7 @@ class Config:
     templates: dict = field(default_factory=lambda: {'rj': DEFAULT_TEMPLATE, 'bj': DEFAULT_TEMPLATE,
                                                      'vj': DEFAULT_TEMPLATE})
     max_name_bytes: int = DEFAULT_MAX_NAME_BYTES
+    request_delay: float = DEFAULT_REQUEST_DELAY   # seconds between DLsite requests (plus random jitter)
 
     def template_for(self, code):
         prefix = code[:2].lower()
@@ -208,6 +217,8 @@ def load_config(basedir, log):
                 log("  使用默認命名模板: " + DEFAULT_TEMPLATE.strip() + "\n")
         if 'max_name_bytes' in config:
             cfg.max_name_bytes = int(config['max_name_bytes'])
+        if 'request_delay' in config:
+            cfg.request_delay = float(config['request_delay'])
     except (OSError, ValueError, TypeError, AttributeError) as err:
         log(f"**配置文件讀取失敗, 使用默認設定: {err}\n")
         return Config()
@@ -215,104 +226,213 @@ def load_config(basedir, log):
 
 
 # ---------------------------------------------------------------------------
-# DLsite access (moved unchanged from the old scripts; reworked in Phase 3)
+# DLsite access (scratchpad 1.3, 1.4 and the Phase 3 product.json research)
+#   1. product.json  -> every field, every DLsite section, one request
+#   2. blocked (403/429/503/529) -> back off, fresh session, retry
+#   3. still blocked -> ajax product info (title, date, age, cover only)
 # ---------------------------------------------------------------------------
-RJ_WEBPATH = 'https://www.dlsite.com/maniax/work/=/product_id/'
-RJ_G_WEBPATH = 'https://www.dlsite.com/home/work/=/product_id/'
-BJ_WEBPATH = 'https://www.dlsite.com/books/work/=/product_id/'
-BJ_G_WEBPATH = 'https://www.dlsite.com/comic/work/=/product_id/'
-VJ_WEBPATH = 'https://www.dlsite.com/pro/work/=/product_id/'
-VJ_G_WEBPATH = 'https://www.dlsite.com/soft/work/=/product_id/'
-WEBPATHS = {'RJ': (RJ_WEBPATH, RJ_G_WEBPATH), 'RE': (RJ_WEBPATH, RJ_G_WEBPATH),
-            'BJ': (BJ_WEBPATH, BJ_G_WEBPATH), 'VJ': (VJ_WEBPATH, VJ_G_WEBPATH)}
-R_COOKIE = {'adultchecked': '1'}
+PRODUCT_URL = 'https://www.dlsite.com/maniax/api/=/product.json'
+INFO_URL = 'https://www.dlsite.com/maniax/product/info/ajax'
+WORK_PAGE = 'https://www.dlsite.com/{site}/work/=/product_id/{code}.html'
+BLOCKED_STATUSES = (403, 429, 503, 529)
 FALLBACK_UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
                '(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36')
 GAME_TYPES = ["アクション", "クイズ", "アドベンチャー", "ロールプレイング", "テーブル", "デジタルノベル",
               "シミュレーション", "タイピング", "シューティング", "パズル", "その他ゲーム"]
+AGE_LABELS = {1: '全年齢', 2: 'R-15', 3: 'R18'}  # same text the work pages show
 
 
 @dataclass
 class WorkInfo:
-    status: int
+    status: int           # 200 ok, 404 not on DLsite, 0 network error, else the HTTP status
     url: str
     fields: dict = None   # None unless status == 200
-    user_agent: str = ''
     error: str = ''       # network error message when status == 0
+    partial: str = ''      # why only basic info is available ('' = full data)
 
 
-class DlsiteFetcher:
-    def __init__(self):
-        import requests
-        from lxml import html
-        self._html = html
-        requests.adapters.DEFAULT_RETRIES = 5
-        self.session = requests.session()
+class BatchAborted(Exception):
+    """DLsite kept blocking after the cool-down; stop asking it for more works."""
+
+
+def _yymmdd(date):
+    m = re.match(r'(\d{4})-(\d{2})-(\d{2})', date or '')
+    return m.group(1)[2:] + m.group(2) + m.group(3) if m else None
+
+
+def _cover_url(url):
+    """Absolute cover URL, or '' for none (DLsite uses a no_img_main.gif placeholder for works without one)."""
+    if not url or '/no_img' in url:
+        return ''
+    return 'https:' + url if url.startswith('//') else url
+
+
+def _work_type(label):
+    return "ゲーム" if label in GAME_TYPES else label
+
+
+def fields_from_product(w):
+    """Fields from one product.json entry."""
+    creaters = w.get('creaters')
+    voices = creaters.get('voice_by') if isinstance(creaters, dict) else None
+    image = w.get('image_main')
+    return {
+        'title': w.get('work_name') or None,
+        'circle': w.get('maker_name') or None,
+        'cv': [v['name'] for v in voices or [] if isinstance(v, dict) and v.get('name')],
+        'author': [a['author_name'] for a in w.get('author') or [] if isinstance(a, dict) and a.get('author_name')],
+        'type': _work_type(w.get('work_type_string')) or None,
+        'work_age': AGE_LABELS.get(w.get('age_category')),
+        'release_date': _yymmdd(w.get('regist_date')),
+        'img_url': _cover_url(image.get('url') if isinstance(image, dict) else ''),
+        'site_id': w.get('site_id'),
+    }
+
+
+def fields_from_info(w):
+    """Fields from the basic info endpoint. circle/cv/author/type are unknown (None)."""
+    date = _yymmdd(w.get('regist_date'))
+    return {
+        'title': w.get('work_name') or None,
+        'circle': None, 'cv': None, 'author': None, 'type': None,
+        'work_age': AGE_LABELS.get(w.get('age_category')),
+        'release_date': None if (w.get('regist_date') or '').startswith('5100') else date,  # 5100 = no date
+        'img_url': _cover_url(w.get('work_image')),
+        'site_id': w.get('site_id'),
+    }
+
+
+class DlsiteClient:
+    """Talks to DLsite. One desktop browser identity per session; a fresh session after a block."""
+
+    def __init__(self, log=print, sleep=time.sleep, backoff=(5, 15, 45), block_limit=3, cooldown=300,
+                 timeout=(5, 20), session_factory=None):
+        self.log, self.sleep = log, sleep
+        self.backoff, self.block_limit, self.cooldown, self.timeout = backoff, block_limit, cooldown, timeout
+        self._session_factory = session_factory or self._make_session
+        self._ua = None
+        self.blocked_streak = 0
+        self.cooled_down = False
+        self.session = self._session_factory()
+
+    # -- session -----------------------------------------------------------
+    def _user_agent(self):
         try:
-            from fake_useragent import UserAgent
-            self._ua = UserAgent()
+            if self._ua is None:
+                from fake_useragent import UserAgent
+                self._ua = UserAgent(browsers=['Chrome', 'Edge', 'Firefox', 'Safari'],
+                                     os=['Windows', 'Mac OS X'], platforms='desktop')
+            return self._ua.random
         except Exception:
-            self._ua = None
-
-    def user_agent(self):
-        try:
-            return self._ua.random if self._ua else FALLBACK_UA
-        except Exception:
+            self._ua = False
             return FALLBACK_UA
 
+    def _make_session(self):
+        import requests
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        session = requests.Session()
+        # Transient server errors only; blocking statuses are handled by _get() with longer waits.
+        retry = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 504],
+                      respect_retry_after_header=True, raise_on_status=False)
+        session.mount('https://', HTTPAdapter(max_retries=retry))
+        session.headers.update({
+            'User-Agent': self._user_agent() if self._ua is not False else FALLBACK_UA,
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'Accept-Language': 'ja,en;q=0.8',
+            'Referer': 'https://www.dlsite.com/',
+        })
+        session.cookies.update({'adultchecked': '1', 'locale': 'ja_JP'})
+        return session
+
+    # -- requests ----------------------------------------------------------
+    def _retry_after(self, response, attempt):
+        value = response.headers.get('Retry-After', '')
+        if value.isdigit():
+            return min(int(value), self.cooldown)
+        return self.backoff[attempt] + random.uniform(0, self.backoff[attempt] / 3)
+
+    def _get(self, url, params):
+        """GET with the blocked-status back-off. Returns the final response."""
+        for attempt in range(len(self.backoff) + 1):
+            response = self.session.get(url, params=params, timeout=self.timeout)
+            if response.status_code not in BLOCKED_STATUSES or attempt == len(self.backoff):
+                return response
+            wait = self._retry_after(response, attempt)
+            self.log(f"**DLsite 回應 HTTP {response.status_code}, {wait:.0f} 秒後以新連線重試 "
+                     f"({attempt + 1}/{len(self.backoff)})")
+            self.sleep(wait)
+            self.session = self._session_factory()
+        return response
+
     def fetch(self, code):
-        primary, general = WEBPATHS[code[:2]]
-        user_agent = self.user_agent()
-        url = primary + code
-        r = self.session.get(url, allow_redirects=True, cookies=R_COOKIE, headers={'user-agent': user_agent})
-        if r.status_code != 200:
-            url = general + code  # general-audience site
-            r = self.session.get(url, allow_redirects=False, cookies=R_COOKIE)
+        """Return a WorkInfo for one work code. Raises BatchAborted, or requests' (OSError) network errors."""
+        params = {'workno': code}
+        r = self._get(PRODUCT_URL, params)
+        url = r.url if hasattr(r, 'url') else PRODUCT_URL
+        if r.status_code == 200:
+            self._not_blocked()
+            data = r.json()
+            if data:
+                fields = fields_from_product(data[0])
+                return WorkInfo(200, WORK_PAGE.format(site=fields['site_id'], code=code), fields)
+            # No full data. Some listings (e.g. per-chapter comics 【話販売】) only have basic info.
+            return self._basic_info(code, WorkInfo(404, url), 'DLsite has only basic info for this work')
+        if r.status_code not in BLOCKED_STATUSES:
+            return WorkInfo(r.status_code, url)
+
+        # Still blocked: basic info as the second source.
+        self.log("**完整資料被拒絕, 改用基本資料 (只有標題/日期/年齡/封面)")
+        result = self._basic_info(code, WorkInfo(r.status_code, url),
+                                  'DLsite blocked the full data; only basic info was available')
+        self._blocked()
+        return result
+
+    def _basic_info(self, code, otherwise, reason):
+        info = self._get(INFO_URL, {'product_id': code, 'cdn_cache_min': 1})
+        if info.status_code != 200:
+            return otherwise
+        data = info.json()
+        if not data:
+            return WorkInfo(404, otherwise.url)
+        if code not in data:
+            return otherwise
+        fields = fields_from_info(data[code])
+        return WorkInfo(200, WORK_PAGE.format(site=fields['site_id'], code=code), fields, partial=reason)
+
+    def _not_blocked(self):
+        self.blocked_streak = 0
+        self.cooled_down = False
+
+    def _blocked(self):
+        """Circuit breaker: after block_limit blocked works in a row, cool down once; then stop."""
+        self.blocked_streak += 1
+        if self.blocked_streak < self.block_limit:
+            return
+        if self.cooled_down:
+            raise BatchAborted(f'DLsite still blocking after a {self.cooldown}s cool-down')
+        self.log(f"**連續 {self.blocked_streak} 個作品被 DLsite 拒絕, 暫停 {self.cooldown} 秒...")
+        self.sleep(self.cooldown)
+        self.session = self._session_factory()
+        self.cooled_down = True
+        self.blocked_streak = self.block_limit - 1  # one more blocked work after the pause stops the batch
+
+    def download_cover(self, img_url, store_path):
+        """Download to a temporary file first, so a failed download never leaves a broken cover.jpg."""
+        part = store_path + '.part'
+        try:
+            r = self.session.get(img_url, timeout=self.timeout, stream=True)
             if r.status_code != 200:
-                return WorkInfo(r.status_code, url, None, user_agent)
-        return WorkInfo(200, url, self._parse(r.content), user_agent)
-
-    def _parse(self, content):
-        tree = self._html.fromstring(content)
-
-        def first(*queries):
-            for q in queries:
-                for v in tree.xpath(q):
-                    if v and v.strip():
-                        return v.strip()
-            return None
-
-        img_url = first('//meta[@property="og:image"]/@content',
-                        '//meta[@name="twitter:image:src"]/@content') or ''
-        if img_url.startswith('//'):
-            img_url = 'https:' + img_url
-        work_type = first('//*[@id="work_outline"]/tr/th[contains(text(), "作品形式")]/../td/div/a/span/text()')
-        if work_type in GAME_TYPES:
-            work_type = "ゲーム"
-        release_date = first('//*[@id="work_outline"]/tr/th[contains(text(), "販売日")]/../td/a/text()')
-        if release_date and len(release_date) >= 11:  # 20ab年cd月ef日 => abcdef
-            release_date = release_date[2:4] + release_date[5:7] + release_date[8:10]
-        return {
-            'img_url': img_url,
-            'title': first('//h1[@id="work_name"]/text()'),
-            'circle': first('//span[@itemprop="brand" and @class="maker_name"]/*/text()'),
-            'cv': [v.strip() for v in tree.xpath(
-                '//*[@id="work_outline"]/tr/th[contains(text(), "声優")]/../td/a/text()') if v.strip()],
-            'author': [v.strip() for v in tree.xpath(
-                '//*[@id="work_maker"]/tr/th[contains(text(), "著者")]/../td/a/text()') if v.strip()],
-            'type': work_type,
-            'work_age': first(
-                '//*[@id="work_outline"]/tr/th[contains(text(), "年齢指定")]/../td/div/a/span/text()',
-                '//*[@id="work_outline"]/tr/th[contains(text(), "年齢指定")]/../td/div/span/text()'),
-            'release_date': release_date,
-        }
-
-    def download_cover(self, img_url, store_path, user_agent):
-        import urllib.request
-        opener = urllib.request.build_opener()
-        opener.addheaders = [('User-agent', user_agent)]
-        urllib.request.install_opener(opener)
-        urllib.request.urlretrieve(img_url, store_path)
+                raise OSError(f'HTTP {r.status_code} {img_url}')
+            if not r.headers.get('Content-Type', 'image/').startswith('image/'):
+                raise OSError(f'not an image: {r.headers.get("Content-Type")} {img_url}')
+            with open(part, 'wb') as f:
+                for chunk in r.iter_content(65536):
+                    f.write(chunk)
+            os.replace(part, store_path)
+        finally:
+            if os.path.exists(part):
+                os.remove(part)
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +447,7 @@ class Options:
 
 
 # Order of categories in the end-of-run list (scratchpad 1.6)
-CATEGORIES = ['missing fields', 'name too long', 'not found', 'http error', 'network error',
+CATEGORIES = ['missing fields', 'name too long', 'not found', 'blocked', 'http error', 'network error',
               'conflict', 'rename failed', 'error']
 
 
@@ -384,11 +504,13 @@ def conflicts(src, dst):
         return True
 
 
-def process(root, options, config, log, fetcher=None, delay=0.1):
+def process(root, options, config, log, fetcher=None, delay=None):
     """Rename DLsite works and repair every other visited name. Returns a Report."""
     report = Report()
     if fetcher is None:
-        fetcher = DlsiteFetcher()
+        fetcher = DlsiteClient(log=log)
+    if delay is None:
+        delay = config.request_delay
     cache = {}
     log("選擇路徑: " + root + ("   [預覽模式]" if options.dry_run else "") + "\n")
 
@@ -449,17 +571,30 @@ def _new_name_for(src, name, code, options, config, log, fetcher, cache, report,
     log('Processing: ' + code)
 
     if code not in cache:
-        try:
-            cache[code] = fetcher.fetch(code)
-        except OSError as err:  # requests' network errors are OSError subclasses
-            cache[code] = WorkInfo(0, '', None, error=str(err))
-        time.sleep(delay)  # avoid being blocked by the server
+        if cache.get('__aborted__'):
+            cache[code] = WorkInfo(-1, '', None, error=cache['__aborted__'])
+        else:
+            try:
+                cache[code] = fetcher.fetch(code)
+            except BatchAborted as err:
+                log(f"**DLsite 持續拒絕連線, 停止查詢其餘作品: {err}")
+                cache['__aborted__'] = str(err)
+                cache[code] = WorkInfo(-1, '', None, error=str(err))
+            except OSError as err:  # requests' network errors are OSError subclasses
+                cache[code] = WorkInfo(0, '', None, error=str(err))
+            if delay:
+                time.sleep(delay + random.uniform(0, delay / 2))  # be polite to the server
     info = cache[code]
 
     if info.status != 200:
         if info.status == 404:
-            log("**爬取DLsite過程中出現錯誤!\n  請檢查本作是否已經下架或被收入合集")
-            report.add(code, 'not found', 'removed or merged into a bundle (HTTP 404)', src)
+            log("**DLsite 上找不到本作!\n  請檢查本作是否已經下架, 尚未發售或被收入合集")
+            report.add(code, 'not found', 'not on DLsite (removed, unreleased or merged into a bundle)', src)
+        elif info.status == -1:
+            report.add(code, 'blocked', f'not looked up: {info.error}', src)
+        elif info.status in BLOCKED_STATUSES:
+            log(f"**DLsite 拒絕連線 (HTTP {info.status}), 已重試仍失敗")
+            report.add(code, 'blocked', f'HTTP {info.status} after retries', src)
         elif info.status == 0:
             log("**請求失敗! 請檢查網絡連接")
             report.add(code, 'network error', info.error, src)
@@ -480,7 +615,7 @@ def _new_name_for(src, name, code, options, config, log, fetcher, cache, report,
         else:
             log("  下載封面...")
             try:
-                fetcher.download_cover(fields['img_url'], store_path, info.user_agent)
+                fetcher.download_cover(fields['img_url'], store_path)
             except OSError as err:
                 log(f"**下載封面過程中出現錯誤! {err}")
 
@@ -488,7 +623,10 @@ def _new_name_for(src, name, code, options, config, log, fetcher, cache, report,
     missing = missing_fields(template, fields)
     if missing:
         log("**缺少欄位, 不重命名: " + ', '.join(missing))
-        report.add(code, 'missing fields', ', '.join(missing), src)
+        detail = ', '.join(missing)
+        if info.partial:
+            detail += f' ({info.partial})'
+        report.add(code, 'missing fields', detail, src)
         return repair_name(name), 'repair'
 
     ext = os.path.splitext(name)[1] if os.path.isfile(src) else ''

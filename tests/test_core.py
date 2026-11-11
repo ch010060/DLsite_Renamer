@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import shutil
@@ -148,9 +149,9 @@ class FakeFetcher:
             raise RuntimeError('boom')
         if code not in self.works:
             return core.WorkInfo(404, 'url/' + code)
-        return core.WorkInfo(200, 'url/' + code, dict(self.works[code]), 'UA')
+        return core.WorkInfo(200, 'url/' + code, dict(self.works[code]))
 
-    def download_cover(self, url, path, ua):
+    def download_cover(self, url, path):
         self.covers.append(path)
         open(path, 'w').close()
 
@@ -254,6 +255,187 @@ class ProcessTest(unittest.TestCase):
         fetcher = FakeFetcher({'RJ123456': dict(FIELDS, title='W', img_url='http://x')})
         self.run_process(fetcher, download_cover=True)
         self.assertIn('RJ123456 W (CV. 三橋渡,他)/cover.jpg', self.tree())
+
+    def test_aborted_batch_lists_remaining_works(self):
+        for n in ('RJ111111.zip', 'RJ222222.zip', 'RJ333333.zip', 'note "x".txt'):
+            self.touch(n)
+
+        class AbortingFetcher(FakeFetcher):
+            def fetch(self, code):
+                self.calls.append(code)
+                raise core.BatchAborted('still blocked')
+        fetcher = AbortingFetcher({})
+        report = self.run_process(fetcher)
+        self.assertEqual(fetcher.calls, ['RJ111111'])  # no more requests after the abort
+        self.assertEqual(sorted(p.code for p in report.problems if p.category == 'blocked'),
+                         ['RJ111111', 'RJ222222', 'RJ333333'])
+        self.assertIn("note 'x'.txt", self.tree())  # local repair still runs
+
+
+FIXTURES = os.path.join(os.path.dirname(__file__), 'fixtures')
+PRODUCT = json.load(open(os.path.join(FIXTURES, 'product_json.json'), encoding='utf-8'))
+INFO = json.load(open(os.path.join(FIXTURES, 'product_info.json'), encoding='utf-8'))
+
+
+class FakeResponse:
+    def __init__(self, status, data=None, headers=None, body=b'img'):
+        self.status_code, self._data, self.headers, self._body = status, data, headers or {}, body
+        self.url = 'fake'
+
+    def json(self):
+        return self._data
+
+    def iter_content(self, size):
+        yield self._body
+
+
+class FakeSession:
+    """Returns queued responses per URL kind ('product', 'info', 'image')."""
+    def __init__(self, queue):
+        self.queue = queue
+        self.calls = []
+
+    def get(self, url, params=None, timeout=None, stream=False):
+        kind = 'product' if 'product.json' in url else 'info' if 'info/ajax' in url else 'image'
+        self.calls.append(kind)
+        return self.queue[kind].pop(0)
+
+
+class ClientTest(unittest.TestCase):
+    def client(self, **queue):
+        self.sessions, self.sleeps, self.logs = [], [], []
+        queue = {k: list(v) for k, v in queue.items()}
+
+        def factory():
+            s = FakeSession(queue)
+            self.sessions.append(s)
+            return s
+        return core.DlsiteClient(log=self.logs.append, sleep=self.sleeps.append, session_factory=factory,
+                                 backoff=(5, 15), block_limit=2, cooldown=300)
+
+    def test_fields_from_real_product_json(self):
+        f = core.fields_from_product(PRODUCT['RJ01671271'])
+        self.assertEqual((f['circle'], f['cv'], f['type'], f['work_age'], f['release_date'], f['site_id']),
+                         ('エーテル@オメガバース専門サークル', ['三橋渡'], 'ボイス・ASMR', 'R18', '260819', 'girls'))
+        self.assertTrue(f['img_url'].startswith('https://img.dlsite.jp/'))
+        f = core.fields_from_product(PRODUCT['BJ100000'])
+        self.assertEqual((f['circle'], f['author'], f['cv'], f['work_age']), ('CLLENN', ['戸池みすき'], [], '全年齢'))
+        f = core.fields_from_product(PRODUCT['VJ01001000'])
+        self.assertEqual(f['cv'], ['乙倉ゆい', '赤月ゆむ', 'くどう彩織', '倉下撫子'])
+        self.assertEqual(f['type'], 'ゲーム')  # アドベンチャー -> ゲーム, as before
+        self.assertEqual(core.fields_from_product(PRODUCT['RJ01386956'])['type'], 'ゲーム')
+        self.assertEqual(core.fields_from_product(PRODUCT['RJ01552342'])['work_age'], 'R-15')
+        self.assertEqual(core.fields_from_product(PRODUCT['RE100000'])['circle'], '丸美企画')
+        self.assertEqual(core.fields_from_product(PRODUCT['RJ01700000'])['circle'], '晓月')  # input code's own
+
+    def test_every_section_renames_with_repo_templates(self):
+        for code, w in PRODUCT.items():
+            fields = core.fields_from_product(w)
+            template = CONFIG_TEMPLATES['bj' if code.startswith('BJ') else 'vj' if code.startswith('VJ') else 'rj']
+            self.assertEqual(core.missing_fields(template, fields), [], code)
+            name, _ = core.build_name(template, code, fields, '.zip', 255)
+            self.assertTrue(name.startswith(code if code[:2] in ('RJ', 'RE') else '[' + code), name)
+
+    def test_ok(self):
+        c = self.client(product=[FakeResponse(200, [PRODUCT['RJ01386956']])])
+        info = c.fetch('RJ01386956')
+        self.assertEqual((info.status, info.partial, info.fields['title']), (200, '', 'ライフガードホリック'))
+        self.assertEqual(info.url, 'https://www.dlsite.com/maniax/work/=/product_id/RJ01386956.html')
+
+    def test_not_found(self):
+        c = self.client(product=[FakeResponse(200, [])], info=[FakeResponse(200, [])])
+        self.assertEqual(c.fetch('RJ999999').status, 404)
+
+    def test_basic_info_only_listing(self):
+        chapter = {'BJ01500000': {'site_id': 'comic', 'work_name': '【話販売】ブルーピリオド（１１）', 'age_category': 1,
+                                  'regist_date': '5100-01-01 00:00:00', 'work_image': '//img/x.jpg'}}
+        c = self.client(product=[FakeResponse(200, [])], info=[FakeResponse(200, chapter)])
+        info = c.fetch('BJ01500000')
+        self.assertEqual((info.status, info.partial), (200, 'DLsite has only basic info for this work'))
+        self.assertIsNone(info.fields['release_date'])  # 5100-01-01 is a placeholder, not a date
+        self.assertEqual(core.missing_fields(CONFIG_TEMPLATES['bj'], info.fields), ['circle', 'author'])
+        self.assertEqual(self.sleeps, [])  # not blocked: no back-off
+
+    def test_blocked_then_ok_uses_retry_after_and_fresh_session(self):
+        c = self.client(product=[FakeResponse(429, headers={'Retry-After': '7'}),
+                                 FakeResponse(200, [PRODUCT['RJ01386956']])])
+        self.assertEqual(c.fetch('RJ01386956').status, 200)
+        self.assertEqual(self.sleeps, [7])
+        self.assertEqual(len(self.sessions), 2)
+
+    def test_backoff_without_retry_after(self):
+        c = self.client(product=[FakeResponse(503), FakeResponse(529), FakeResponse(200, [PRODUCT['RE100000']])])
+        self.assertEqual(c.fetch('RE100000').status, 200)
+        self.assertEqual(len(self.sleeps), 2)
+        self.assertTrue(5 <= self.sleeps[0] <= 5 + 5 / 3 and 15 <= self.sleeps[1] <= 20)
+
+    def test_blocked_falls_back_to_basic_info(self):
+        c = self.client(product=[FakeResponse(403)] * 3, info=[FakeResponse(200, INFO)])
+        info = c.fetch('RJ01700000')
+        self.assertEqual((info.status, info.partial),
+                         (200, 'DLsite blocked the full data; only basic info was available'))
+        self.assertTrue(info.fields['title'].startswith('【繁体中文版】'))
+        self.assertIsNone(info.fields['circle'])
+        self.assertEqual(core.missing_fields(CONFIG_TEMPLATES['rj'], info.fields), ['cv'])
+        self.assertEqual(core.missing_fields('workno title', info.fields), [])
+
+    def test_blocked_everywhere(self):
+        c = self.client(product=[FakeResponse(403)] * 3, info=[FakeResponse(403)] * 3)
+        self.assertEqual(c.fetch('RJ123456').status, 403)
+
+    def test_other_http_error_no_retry(self):
+        c = self.client(product=[FakeResponse(500)])
+        self.assertEqual(c.fetch('RJ123456').status, 500)
+        self.assertEqual(self.sleeps, [])
+
+    def test_circuit_breaker(self):
+        blocked = [FakeResponse(403)] * 3
+        c = self.client(product=blocked * 4, info=blocked * 4)
+        c.fetch('RJ111111')                       # streak 1
+        c.fetch('RJ222222')                       # streak 2 -> cool-down
+        self.assertIn(300, self.sleeps)
+        with self.assertRaises(core.BatchAborted):
+            c.fetch('RJ333333')                   # still blocked after the pause -> stop
+
+    def test_success_resets_breaker(self):
+        blocked = [FakeResponse(403)] * 3
+        c = self.client(product=blocked + [FakeResponse(200, [PRODUCT['RJ01386956']])] + blocked,
+                        info=blocked * 2)
+        c.fetch('RJ111111')
+        c.fetch('RJ01386956')
+        c.fetch('RJ222222')
+        self.assertNotIn(300, self.sleeps)
+
+    def test_no_image_placeholder_is_no_cover(self):
+        info = {'work_name': 'x', 'age_category': 3, 'regist_date': None,
+                'work_image': '//www.dlsite.com/images/web/home/no_img_main.gif'}
+        self.assertEqual(core.fields_from_info(info)['img_url'], '')
+        self.assertEqual(core.fields_from_product({'image_main': {'url': '//www.dlsite.com/images/web/home/no_img_main.gif'}})['img_url'], '')
+
+    def test_cover_rejects_non_image(self):
+        d = tempfile.mkdtemp()
+        try:
+            c = self.client(image=[FakeResponse(200, headers={'Content-Type': 'text/html'})])
+            with self.assertRaises(OSError):
+                c.download_cover('https://img/x.jpg', os.path.join(d, 'cover.jpg'))
+            self.assertEqual(os.listdir(d), [])
+        finally:
+            shutil.rmtree(d)
+
+    def test_cover_download_atomic(self):
+        d = tempfile.mkdtemp()
+        try:
+            target = os.path.join(d, 'cover.jpg')
+            c = self.client(image=[FakeResponse(200, body=b'\xff\xd8jpeg'), FakeResponse(404)])
+            c.download_cover('https://img/x.jpg', target)
+            with open(target, 'rb') as f:
+                self.assertEqual(f.read(), b'\xff\xd8jpeg')
+            os.remove(target)
+            with self.assertRaises(OSError):
+                c.download_cover('https://img/x.jpg', target)
+            self.assertEqual(os.listdir(d), [])  # no cover.jpg, no .part left behind
+        finally:
+            shutil.rmtree(d)
 
 
 class ConfigTest(unittest.TestCase):
