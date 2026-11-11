@@ -4,6 +4,8 @@ import sys
 
 import renamer_core as core
 
+VERSION = '4.0'
+
 
 def dir_path(path):
     if os.path.isdir(path):
@@ -12,7 +14,7 @@ def dir_path(path):
 
 
 def process_command():
-    parser = argparse.ArgumentParser(description="Renamer for DLsite works v3.7")
+    parser = argparse.ArgumentParser(description=f"Renamer for DLsite works v{VERSION}")
     parser.add_argument('-d', "--DEL", action='store_true', help='delete string in 【】')
     parser.add_argument('-c', "--COVER", action='store_true', help='download cover')
     parser.add_argument('-r', "--RECUR", action='store_true', help='recursively processing')
