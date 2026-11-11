@@ -139,6 +139,61 @@ class BuildNameTest(unittest.TestCase):
         self.assertEqual(core.missing_fields(CONFIG_TEMPLATES['rj'], dict(FIELDS, cv=[])), [])
 
 
+LONG_TITLES = json.load(open(os.path.join(os.path.dirname(__file__), 'fixtures', 'long_titles.json'),
+                             encoding='utf-8'))
+
+
+class NaturalCutTest(unittest.TestCase):
+    """Phase 5: shortened titles end at a natural break (21 real DLsite titles of 200-256 bytes)."""
+
+    def shorten(self, code, limit):
+        fields = dict(FIELDS, title=LONG_TITLES[code], cv=['三橋渡'])
+        name, short = core.build_name(CONFIG_TEMPLATES['rj'], code, fields, '.zip', limit)
+        self.assertTrue(name.startswith(code + ' ') and name.endswith(' (CV. 三橋渡).zip'), name)
+        return name[len(code) + 1:-len(' (CV. 三橋渡).zip')], short
+
+    def test_examples(self):
+        cases = [  # (code, limit, expected end of the shortened title)
+            ('RJ01671271', 255, '連続絶頂えっち♡'),            # was "…えっち♡ #"
+            ('RJ01450049', 255, '絶対、離さない…'),             # was "…【関西弁×3P×緊縛×絶"
+            ('RJ01551013', 255, '吹いても止めない✨'),          # was "…✨ノン"
+            ('RJ01450015', 255, '詰め込み豪華'),                # was "…豪華パ"
+            ('RJ01551009', 255, '虜になりました。'),            # was "…〜はじめてのケイケ"
+            ('RJ01671271', 143, '俺の全部だ。」'),
+            ('RJ01650076', 143, '信者に堕とされる'),            # okurigana kept whole
+            ('RJ01650095', 143, 'オホ声チン媚び常識改変'),
+        ]
+        for code, limit, end in cases:
+            title, short = self.shorten(code, limit)
+            self.assertTrue(short, code)
+            self.assertTrue(title.endswith(end), f'{code}@{limit}: {title}')
+
+    def test_all_titles_both_limits(self):
+        for limit in (255, 143):
+            for code in LONG_TITLES:
+                title, short = self.shorten(code, limit)
+                if not short:
+                    continue
+                full = core.normalize_name(LONG_TITLES[code], collapse_spaces=True)
+                self.assertTrue(full.startswith(title), code)                      # a prefix, nothing invented
+                self.assertNotIn(title[-1], core._TRAILING_JUNK, f'{code}@{limit}: {title}')
+                self.assertLessEqual(core.name_bytes(core.build_name(
+                    CONFIG_TEMPLATES['rj'], code, dict(FIELDS, title=LONG_TITLES[code], cv=['三橋渡']),
+                    '.zip', limit)[0]), limit)
+
+    def test_keeps_at_least_60_percent(self):
+        title = 'あ' * 30 + '、' + 'い' * 100   # only break is far back -> not used
+        self.assertEqual(core.natural_cut(title, 100), title[:100])
+        title = 'あ' * 70 + '、' + 'い' * 100   # break within 60 % -> used, trailing 、 removed
+        self.assertEqual(core.natural_cut(title, 100), 'あ' * 70)
+
+    def test_okurigana_not_split(self):
+        self.assertEqual(core.natural_cut('信者に堕とされる快楽', 6), '信者に')
+
+    def test_no_break_falls_back_to_char_cut(self):
+        self.assertEqual(core.natural_cut('あ' * 50, 20), 'あ' * 20)
+
+
 class FakeFetcher:
     def __init__(self, works, fail=()):
         self.works, self.fail, self.calls, self.covers = works, fail, [], []

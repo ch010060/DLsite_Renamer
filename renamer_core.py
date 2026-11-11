@@ -99,6 +99,57 @@ class NameTooLong(Exception):
     pass
 
 
+# Natural breaks for shortened titles (Phase 5). A cut is moved back to the nearest break that keeps
+# at least MIN_KEEP of the longest title that fits.
+MIN_KEEP = 0.6
+_OPENING = set('「『【（([［〈《〔｛{“‘')
+_BREAK_BEFORE = _OPENING | set('～〜')                            # subtitle markers start a new part
+_BREAK_AFTER = set(' \u3000、。，．,!！?？…‥」』】）)］]〉》〕｝}♪★☆♡♥')
+_TRAILING_JUNK = set(' \u3000、，,・/／|｜×✖⇒→＋+&＆#＃-－:：～〜~') | _OPENING
+
+
+def _script(ch):
+    """Script class for weak breaks; None = continues the previous run (ー, combining marks)."""
+    if ch == 'ー' or unicodedata.combining(ch):
+        return None
+    o = ord(ch)
+    if 0x30A0 <= o <= 0x30FF or 0x31F0 <= o <= 0x31FF:
+        return 'kata'
+    if 0x3040 <= o <= 0x309F:
+        return 'hira'
+    if 0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF or ch in '々〆':
+        return 'kanji'
+    return 'latin' if ch.isalnum() else 'other'
+
+
+def _weak_break(title, j):
+    """After an emoji/symbol, or where the script changes (never kanji→hiragana: that splits okurigana)."""
+    if unicodedata.category(title[j - 1]) == 'So':
+        return True
+    a, b = _script(title[j - 1]), _script(title[j])
+    return bool(a and b and a != b and 'other' not in (a, b) and (a, b) != ('kanji', 'hira'))
+
+
+def natural_cut(title, k):
+    """Shorten title to at most k characters, ending at a natural break where possible."""
+    if k >= len(title):
+        return title
+    low = max(1, int(k * MIN_KEEP))
+    cut = k
+    ok = [j for j in range(k, low - 1, -1) if not unicodedata.combining(title[j])]
+    strong = [j for j in ok if title[j - 1] in _BREAK_AFTER or title[j] in _BREAK_BEFORE]
+    if strong:
+        cut = strong[0]
+    else:
+        weak = [j for j in ok if _weak_break(title, j)]
+        if weak:
+            cut = weak[0]
+    t = title[:cut]
+    while t and t[-1] in _TRAILING_JUNK:
+        t = t[:-1]
+    return t or title[:k].rstrip()
+
+
 def prepare_template(template, fields):
     """Apply the existing empty-list rules to the template before substitution."""
     if not fields.get('author'):
@@ -154,17 +205,19 @@ def build_name(template, code, fields, ext, max_bytes):
 
     # Valid cut points: never directly before a combining mark.
     cuts = [k for k in range(len(title)) if not unicodedata.combining(title[k])]
-    lo, hi, best = 0, len(cuts) - 1, None
+    lo, hi, best, best_k = 0, len(cuts) - 1, None, 0
     while lo <= hi:  # largest cut that fits (name length grows with the cut)
         mid = (lo + hi) // 2
         candidate = make(title[:cuts[mid]].rstrip())
         if name_bytes(candidate) <= max_bytes:
-            best, lo = candidate, mid + 1
+            best, best_k, lo = candidate, cuts[mid], mid + 1
         else:
             hi = mid - 1
     if best is None:
         raise NameTooLong(full)
-    return best, True
+    # Move the cut back to a natural break (never longer, so it still fits).
+    natural = make(natural_cut(title, best_k))
+    return (natural if name_bytes(natural) <= max_bytes else best), True
 
 
 # ---------------------------------------------------------------------------
